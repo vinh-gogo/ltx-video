@@ -370,14 +370,31 @@ def is_server_running(port=8188):
 
 
 _SERVER_STATE = {"running_low_vram": None}
+_COMFY_NODES = None  # cache danh sách node ComfyUI, reset khi server restart
+
+
+def _get_comfy_nodes():
+    """Lazy-load danh sách node types từ ComfyUI API (gọi 1 lần/session).
+    Trả về set tên node, hoặc set rỗng nếu không lấy được."""
+    global _COMFY_NODES
+    if _COMFY_NODES is None:
+        try:
+            resp = urllib.request.urlopen(
+                urllib.request.Request("http://127.0.0.1:8188/object_info"), timeout=10)
+            _COMFY_NODES = set(json.loads(resp.read()).keys())
+        except Exception:
+            _COMFY_NODES = set()
+    return _COMFY_NODES
 
 
 def ensure_server(low_vram, boot_timeout=300):
+    global _COMFY_NODES
     need_restart = (not is_server_running()) or (_SERVER_STATE["running_low_vram"] != low_vram)
     if not need_restart:
         return
     os.system("fuser -k 8188/tcp")
     time.sleep(2)
+    _COMFY_NODES = None  # reset node cache sau khi server restart
     os.chdir("/content/ComfyUI")
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     cmd = ["python", "main.py"]
@@ -394,9 +411,11 @@ def ensure_server(low_vram, boot_timeout=300):
 
 
 def force_restart_server():
+    global _COMFY_NODES
     os.system("fuser -k 8188/tcp")
     time.sleep(2)
     _SERVER_STATE["running_low_vram"] = None
+    _COMFY_NODES = None  # reset node cache
     return "✅ Đã tắt server cũ để giải phóng VRAM. Lần tạo video tiếp theo sẽ tự khởi động lại."
 
 
@@ -620,10 +639,23 @@ def set_audio_ref_tokens(wf, positive_ref, negative_ref, audio_latent_ref, start
     """
     if audio_latent_ref is None:
         return positive_ref, negative_ref, start_id
+    if "LTXVSetAudioRefTokens" not in _get_comfy_nodes():
+        print("⚠️ [Voice Lock] Node 'LTXVSetAudioRefTokens' không có trong ComfyUI "
+              "→ bỏ qua Voice Lock. Hãy bấm '🔄 Restart' rồi thử lại, "
+              "hoặc cập nhật ComfyUI-LTXVideo (cd /content/ComfyUI/custom_nodes/ComfyUI-LTXVideo && git pull).")
+        return positive_ref, negative_ref, start_id
     node_id = str(start_id)
     wf[node_id] = {"class_type": "LTXVSetAudioRefTokens",
                     "inputs": {"positive": positive_ref, "negative": negative_ref, "audio_latent": audio_latent_ref}}
     return [node_id, 0], [node_id, 1], start_id + 1
+
+
+def _is_ic_lora_file(filename):
+    """Kiểm tra (dựa trên tên file) liệu đây có phải IC-LoRA Ingredients của
+    Lightricks không. LoRA thường đặt vào IC-LoRA dropdown sẽ bị bỏ qua thay
+    vì gây lỗi 'LTXICLoRALoaderModelOnly not found'."""
+    name = (filename or "").lower()
+    return "ic-lora" in name or "ic_lora" in name or "ingredients" in name
 
 
 def apply_ic_lora_ingredients(wf, model_source, positive_ref, negative_ref, latent_ref, vae_ref,
@@ -666,7 +698,7 @@ def apply_ic_lora_ingredients(wf, model_source, positive_ref, negative_ref, late
     Nếu thiếu ic_lora_name hoặc thiếu ref_image_name thì trả nguyên các ref
     đầu vào — không đổi hành vi/workflow gốc.
     """
-    if not ic_lora_name or ic_lora_name == NO_LORA_LABEL or not ref_image_name:
+    if not ic_lora_name or ic_lora_name == NO_LORA_LABEL or not ref_image_name or not _is_ic_lora_file(ic_lora_name):
         return model_source, positive_ref, negative_ref, latent_ref
 
     node_loader = str(start_id)
