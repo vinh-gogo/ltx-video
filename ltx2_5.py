@@ -979,6 +979,308 @@ def build_flf2v_workflow(*, first_image_name, last_image_name, prompt_text, nega
     return wf
 
 
+# ==========================================================================
+# A2V — AUDIO-TO-VIDEO HELPER FUNCTIONS
+# ==========================================================================
+
+def _get_audio_duration(audio_path):
+    """Lấy độ dài audio (giây) bằng ffprobe. Trả về 0.0 nếu lỗi."""
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+           "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def _extract_audio_segment(audio_path, start_sec, duration_sec, output_path):
+    """Cắt 1 đoạn audio [start_sec, start_sec+duration_sec] ra file WAV.
+    Nếu audio ngắn hơn cần thiết, ffmpeg tự dừng — không báo lỗi.
+    Trả về output_path nếu thành công, None nếu thất bại."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", audio_path,
+        "-ss", str(start_sec), "-t", str(duration_sec),
+        "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0 and os.path.exists(output_path):
+        return output_path
+    return None
+
+
+def build_a2v_workflow(*, audio_name, prompt_text, negative_text=NEGATIVE_PROMPT_DEFAULT,
+                        width, height, fps, duration, seed,
+                        image_name=None, image_strength=0.7,
+                        lora1_name=NO_LORA_LABEL, lora1_strength=1.0,
+                        lora2_name=NO_LORA_LABEL, lora2_strength=0.6,
+                        ic_lora_name=NO_LORA_LABEL, ic_lora_strength=1.0,
+                        ic_ref_image_name=None, ic_guide_strength=1.0):
+    """A2V workflow: thay LTXVEmptyLatentAudio bằng LTXVAudioVAEEncode thực tế
+    để model nghe và khớp video với audio đầu vào (lip-sync, nhịp điệu, v.v.).
+    Hỗ trợ cả T2V (image_name=None) và I2V (image_name=tên ảnh).
+    audio_cfg=3.0 (cao hơn T2V/I2V=1.0) để audio dẫn dắt mạnh hơn."""
+    safe_fps = snap_fps_safe(fps)
+    total_frames = total_frames_for(duration, safe_fps)
+    half_w, half_h = half_dims(width, height)
+
+    wf = _clip_text_nodes(prompt_text, negative_text)
+
+    # --- Nodes nền tảng ---
+    wf.update({
+        "4":  {"class_type": "LTXVConditioning",
+               "inputs": {"positive": ["2", 0], "negative": ["3", 0], "frame_rate": float(safe_fps)}},
+        "5":  {"class_type": "UNETLoader",  "inputs": {"unet_name": UNET_FILENAME, "weight_dtype": "default"}},
+        "6":  {"class_type": "VAELoader",   "inputs": {"vae_name": VIDEO_VAE_FILENAME}},
+        "7":  {"class_type": "VAELoader",   "inputs": {"vae_name": AUDIO_VAE_FILENAME}},
+        # Load & encode audio thực tế (node 90-91 tránh đụng node ID với LoRA 100+)
+        "90": {"class_type": "LoadAudio",
+               "inputs": {"audio": audio_name}},
+        "91": {"class_type": "LTXVAudioVAEEncode",
+               "inputs": {"audio": ["90", 0], "audio_vae": ["7", 0]}},
+        # Video latent Pass 1
+        "8":  {"class_type": "EmptyLTXVLatentVideo",
+               "inputs": {"width": half_w, "height": half_h, "length": total_frames, "batch_size": 1}},
+    })
+
+    # --- I2V: gắn ảnh vào latent ---
+    if image_name:
+        wf.update({
+            "30": {"class_type": "LoadImage", "inputs": {"image": image_name}},
+            "31": {"class_type": "ImageResizeKJv2",
+                   "inputs": {"width": width, "height": height, "upscale_method": "lanczos",
+                              "keep_proportion": "crop", "pad_color": "0, 0, 0",
+                              "crop_position": "center", "divisible_by": 32, "device": "cpu",
+                              "image": ["30", 0]}},
+            "32": {"class_type": "LTXVPreprocess", "inputs": {"img_compression": 18, "image": ["31", 0]}},
+            "33": {"class_type": "LTXVImgToVideoInplace",
+                   "inputs": {"vae": ["6", 0], "image": ["32", 0], "latent": ["8", 0],
+                              "strength": float(image_strength), "bypass": False}},
+        })
+        video_latent_p1 = ["33", 0]
+        ic_base_latent   = ["33", 0]
+    else:
+        video_latent_p1 = ["8", 0]
+        ic_base_latent   = ["8", 0]
+
+    # --- Ghép AV latent Pass 1, Sampler, Upscaler, Pass 2, Decode ---
+    wf.update({
+        "10": {"class_type": "LTXVConcatAVLatent",
+               "inputs": {"video_latent": video_latent_p1, "audio_latent": ["91", 0]}},
+        "11": {"class_type": "RandomNoise",     "inputs": {"noise_seed": seed}},
+        "12": {"class_type": "KSamplerSelect",  "inputs": {"sampler_name": "euler_ancestral"}},
+        "13": {"class_type": "ManualSigmas",    "inputs": {"sigmas": SIGMAS_PASS1}},
+        # audio_cfg cao hơn bình thường để audio dẫn dắt mạnh hơn
+        "14": {"class_type": "LTXVDualCFGGuider",
+               "inputs": {"model": ["5", 0], "positive": ["4", 0], "negative": ["4", 1],
+                          "video_cfg": 1.0, "audio_cfg": 3.0}},
+        "15": {"class_type": "SamplerCustomAdvanced",
+               "inputs": {"noise": ["11", 0], "guider": ["14", 0], "sampler": ["12", 0],
+                          "sigmas": ["13", 0], "latent_image": ["10", 0]}},
+        "16": {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["15", 0]}},
+        "17": {"class_type": "LatentUpscaleModelLoader", "inputs": {"model_name": SPATIAL_UPSCALER_FILENAME}},
+        "18": {"class_type": "LTXVLatentUpsampler",
+               "inputs": {"samples": ["16", 0], "upscale_model": ["17", 0], "vae": ["6", 0]}},
+    })
+
+    # Pass 2: I2V → tiêm lại ảnh vào latent upscaled; T2V → ghép thẳng
+    if image_name:
+        wf["34"] = {"class_type": "LTXVImgToVideoInplace",
+                    "inputs": {"vae": ["6", 0], "image": ["32", 0], "latent": ["18", 0],
+                               "strength": 1.0, "bypass": False}}
+        video_latent_p2 = ["34", 0]
+    else:
+        video_latent_p2 = ["18", 0]
+
+    wf.update({
+        "19": {"class_type": "LTXVConcatAVLatent",
+               "inputs": {"video_latent": video_latent_p2, "audio_latent": ["91", 0]}},
+        "20": {"class_type": "RandomNoise",    "inputs": {"noise_seed": PASS2_FIXED_NOISE_SEED}},
+        "21": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler_ancestral"}},
+        "22": {"class_type": "ManualSigmas",   "inputs": {"sigmas": SIGMAS_PASS2}},
+        "23": {"class_type": "LTXVDualCFGGuider",
+               "inputs": {"model": ["5", 0], "positive": ["4", 0], "negative": ["4", 1],
+                          "video_cfg": 1.0, "audio_cfg": 3.0}},
+        "24": {"class_type": "SamplerCustomAdvanced",
+               "inputs": {"noise": ["20", 0], "guider": ["23", 0], "sampler": ["21", 0],
+                          "sigmas": ["22", 0], "latent_image": ["19", 0]}},
+        "25": {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["24", 0]}},
+        "26": {"class_type": "VAEDecodeTiled",
+               "inputs": {"samples": ["25", 0], "vae": ["6", 0],
+                          "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 16}},
+        "27": {"class_type": "LTXVAudioVAEDecode", "inputs": {"samples": ["25", 1], "audio_vae": ["7", 0]}},
+        "28": {"class_type": "CreateVideo",
+               "inputs": {"images": ["26", 0], "audio": ["27", 0], "fps": float(safe_fps)}},
+        "29": {"class_type": "SaveVideo",
+               "inputs": {"video": ["28", 0], "filename_prefix": "video/ltx25_a2v",
+                          "format": "auto", "codec": "auto"}},
+    })
+
+    # --- LoRA thường ---
+    model_ref = apply_lora_stack(wf, ["5", 0], lora1_name, lora1_strength, lora2_name, lora2_strength)
+
+    # --- IC-LoRA Ingredients (chỉ Pass 1) ---
+    model_ref, p1_pos, p1_neg, p1_video_latent = apply_ic_lora_ingredients(
+        wf, model_ref, ["4", 0], ["4", 1], ic_base_latent, ["6", 0],
+        ic_lora_name, ic_lora_strength, ic_ref_image_name, ic_guide_strength)
+
+    wf["10"]["inputs"]["video_latent"] = p1_video_latent
+    wf["14"]["inputs"]["model"]    = model_ref
+    wf["14"]["inputs"]["positive"] = p1_pos
+    wf["14"]["inputs"]["negative"] = p1_neg
+    wf["23"]["inputs"]["model"]    = model_ref
+    return wf
+
+
+# ==========================================================================
+# TAB 4 — A2V Storyboard: Video đồng bộ với Audio xuyên suốt
+# ==========================================================================
+
+def generate_a2v_storyboard_gradio(audio_path, img_path, prompts_text, aspect_ratio,
+                                    v_length, v_fps, v_seed, low_vram, frame_percent,
+                                    image_strength,
+                                    lora1_name, lora1_strength, lora2_name, lora2_strength,
+                                    char_ref_path, ic_lora_name, ic_lora_strength, ic_guide_strength):
+    """Generator: chia audio thành đoạn/cảnh, sinh video A2V từng cảnh,
+    ghép lại và thay audio track bằng audio gốc để đồng bộ hoàn hảo."""
+    if not audio_path:
+        yield None, None, "⚠️ Vui lòng upload file audio (wav/mp3) trước!"
+        return
+    prompts = split_prompts(prompts_text)
+    if not prompts:
+        yield None, None, "⚠️ Vui lòng nhập ít nhất 1 prompt (mỗi cảnh 1 đoạn văn)!"
+        return
+
+    v_length = int(v_length)
+    frame_percent = int(frame_percent)
+    v_width, v_height = parse_aspect_ratio(aspect_ratio)
+    safe_width, safe_height = safe_dims(v_width, v_height)
+    total_scenes = len(prompts)
+    total_needed = total_scenes * v_length
+
+    # Kiểm tra độ dài audio
+    audio_dur = _get_audio_duration(audio_path)
+    dur_note = ""
+    if audio_dur > 0:
+        if audio_dur < total_needed:
+            dur_note = (f" ⚠️ Audio dài {audio_dur:.1f}s < tổng {total_needed}s "
+                        f"({total_scenes} cảnh × {v_length}s) — các cảnh cuối sẽ chạy hết audio.")
+        else:
+            dur_note = f" (audio {audio_dur:.1f}s, lấy {total_needed}s)"
+
+    yield None, None, f"🔄 Khởi động server...{dur_note}"
+    try:
+        ensure_server(low_vram)
+    except Exception as e:
+        yield None, None, f"❌ {e}"
+        return
+
+    base_seed = get_seed(v_seed)
+    yield None, None, (f"✅ Server sẵn sàng. Bắt đầu tạo {total_scenes} cảnh A2V "
+                       f"(Seed: {base_seed}){dur_note}")
+    os.makedirs(INPUT_DIR, exist_ok=True)
+
+    # IC-LoRA reference image
+    ic_ref_img_name = None
+    if char_ref_path:
+        ic_ref_img_name = f"ic_ref_a2v_{int(time.time())}.png"
+        shutil.copy(char_ref_path, os.path.join(INPUT_DIR, ic_ref_img_name))
+
+    generated_videos = []
+    current_img_path = img_path   # None → T2V; có ảnh → I2V
+
+    for i, p in enumerate(prompts):
+        label = f"cảnh {i + 1}/{total_scenes}"
+        start_sec = i * v_length
+
+        # --- Cắt đoạn audio tương ứng ---
+        seg_name = f"a2v_seg_{i}_{int(time.time())}.wav"
+        seg_path = os.path.join(INPUT_DIR, seg_name)
+        extracted = _extract_audio_segment(audio_path, start_sec, v_length, seg_path)
+        if not extracted:
+            yield generated_videos, None, f"⚠️ Không cắt được audio cho {label} (ffmpeg lỗi)!"
+            return
+
+        mode_note = "I2V+A" if current_img_path else "T2V+A"
+        yield (generated_videos, None,
+               f"🔄 [{mode_note}] Đang tạo {label} "
+               f"(audio {start_sec:.0f}s–{start_sec + v_length:.0f}s)...\n📝 {p}")
+
+        # --- Chuẩn bị ảnh (nếu có) ---
+        img_name = None
+        if current_img_path:
+            img_name = f"a2v_frame_{i}_{int(time.time())}.png"
+            shutil.copy(current_img_path, os.path.join(INPUT_DIR, img_name))
+
+        wf = build_a2v_workflow(
+            audio_name=seg_name, prompt_text=p,
+            width=safe_width, height=safe_height,
+            fps=v_fps, duration=v_length, seed=base_seed + i,
+            image_name=img_name, image_strength=image_strength,
+            lora1_name=lora1_name, lora1_strength=lora1_strength,
+            lora2_name=lora2_name, lora2_strength=lora2_strength,
+            ic_lora_name=ic_lora_name, ic_lora_strength=ic_lora_strength,
+            ic_ref_image_name=ic_ref_img_name, ic_guide_strength=ic_guide_strength,
+        )
+
+        try:
+            submit_and_wait(wf, scene_label=label)
+        except Exception as e:
+            yield generated_videos, None, f"❌ {e}"
+            return
+
+        latest_video = find_latest_video()
+        if not latest_video:
+            yield generated_videos, None, f"⚠️ Không tìm thấy video {label}!"
+            return
+        generated_videos.append(latest_video)
+
+        # --- Trích khung hình cuối làm ảnh đầu cảnh tiếp ---
+        if i < total_scenes - 1:
+            next_img = os.path.join(INPUT_DIR, f"a2v_extracted_{i}_{int(time.time())}.png")
+            extract_frame_at_percent(latest_video, next_img, frame_percent)
+            current_img_path = next_img
+            yield generated_videos, None, f"🔔 [DING] ✅ Xong {label}. Chuẩn bị cảnh tiếp theo..."
+        else:
+            yield generated_videos, None, f"🔔 [DING] ✅ Xong {label}."
+
+    # --- Ghép video + thay audio gốc để đồng bộ hoàn hảo ---
+    if len(generated_videos) > 1:
+        yield generated_videos, None, "🔄 Đang ghép video và đồng bộ audio gốc..."
+        try:
+            concat_out = concat_videos(generated_videos, "a2v_concat_raw")
+        except Exception as e:
+            yield generated_videos, None, f"⚠️ Ghép video thất bại: {e}"
+            return
+
+        # Thay toàn bộ audio track bằng audio gốc → đồng bộ hoàn hảo
+        final_output = os.path.join(OUTPUT_DIR, f"final_a2v_{int(time.time())}.mp4")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", concat_out,
+            "-i", audio_path,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-shortest",          # cắt theo track ngắn hơn
+            "-c:v", "copy", "-c:a", "aac",
+            final_output,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0 and os.path.exists(final_output):
+            yield generated_videos, final_output, (
+                f"🔔 [DING] 🎉 Hoàn thành! Video {total_scenes} cảnh đã đồng bộ "
+                f"với audio gốc. Base Seed: {base_seed}")
+        else:
+            # Fallback: trả về video ghép không thay audio
+            yield generated_videos, concat_out, (
+                "🔔 [DING] ✅ Ghép xong (không thay được audio gốc — "
+                "kiểm tra ffmpeg). Video dùng audio từ từng cảnh lẻ.")
+    else:
+        yield generated_videos, generated_videos[0], (
+            f"🔔 [DING] 🎉 Hoàn thành! (Seed: {base_seed})")
+
+
 def submit_and_wait(workflow, scene_label="", max_wait_seconds=1800, poll_interval=2):
     data = json.dumps({"prompt": workflow}).encode("utf-8")
     req = urllib.request.Request("http://127.0.0.1:8188/prompt", data=data)
@@ -1878,6 +2180,111 @@ with gr.Blocks(
                 fn=clear_all_flfsb,
                 outputs=[*images_flfsb_first, *images_flfsb_last, gallery_flfsb, video_out_flfsb, status_flfsb,
                          prompt_flfsb, scene_count_display_flfsb],
+            )
+
+        # ======================================================================
+        # TAB 4 — A2V Storyboard: Video đồng bộ Audio xuyên suốt
+        # ======================================================================
+        with gr.Tab("🎵 Tab 4 – A2V Storyboard"):
+            gr.HTML("""
+            <div class="info-callout">
+              <p>🎵 <strong>Audio-to-Video Storyboard</strong> — Upload 1 file audio dài (giọng đọc / nhạc / lồng tiếng).
+              Mỗi cảnh sẽ nhận đúng đoạn audio tương ứng làm tín hiệu điều khiển model.
+              Video ghép cuối cùng sẽ được thay audio track bằng audio gốc → đồng bộ giọng nói hoàn hảo xuyên suốt storyboard.<br>
+              <strong>Chế độ:</strong> T2V+Audio (không ảnh) hoặc I2V+Audio (có ảnh đầu). Từ cảnh 2 trở đi tự dùng khung hình cuối cảnh trước.</p>
+            </div>
+            """)
+            with gr.Row():
+                with gr.Column(scale=4):
+                    with gr.Group(elem_classes="settings-card"):
+                        # --- Audio & ảnh đầu ---
+                        gr.Markdown("#### 🎵 Audio & Ảnh Đầu")
+                        audio_a2v = gr.Audio(
+                            label="🎙️ File Audio (wav/mp3/flac) — giọng đọc / nhạc nền",
+                            type="filepath", sources=["upload"],
+                        )
+                        img_a2v = gr.Image(
+                            label="🖼️ Ảnh đầu (tuỳ chọn) — có ảnh → I2V+Audio; bỏ trống → T2V+Audio",
+                            type="filepath", sources=["upload", "clipboard"],
+                        )
+                        image_strength_a2v = gr.Slider(
+                            label="Độ bám ảnh đầu (image strength)",
+                            minimum=0.1, maximum=1.0, step=0.05, value=0.7,
+                            info="Chỉ có tác dụng khi có ảnh đầu",
+                        )
+
+                        gr.Markdown("#### 📝 Kịch bản (mỗi cảnh 1 đoạn, cách nhau bởi dòng trống)")
+                        prompt_a2v = gr.Textbox(
+                            label="Prompts",
+                            placeholder=(
+                                "A news anchor speaking clearly to camera, professional studio background, warm lighting\n\n"
+                                "Close-up of the anchor gesturing, charts appearing on screen behind\n\n"
+                                "Wide shot of the studio, anchor wrapping up the segment"
+                            ),
+                            lines=8,
+                        )
+                        scene_count_a2v = gr.Markdown("🔹 **Số phân cảnh:** 0")
+
+                        # --- Thông số ---
+                        gr.Markdown("#### ⚙️ Thông số Render")
+                        with gr.Row():
+                            ratio_a2v  = gr.Dropdown(label="Tỉ lệ khung hình", choices=ASPECT_RATIO_CHOICES,
+                                                      value="16:9 (832x480) · Mặc định")
+                            length_a2v = gr.Slider(label="Thời lượng mỗi cảnh (giây)",
+                                                    minimum=1, maximum=10, step=1, value=5)
+                        with gr.Row():
+                            fps_a2v    = gr.Slider(label="FPS", minimum=8, maximum=32, step=8, value=24)
+                            seed_a2v   = gr.Textbox(label="Seed (-1 = ngẫu nhiên)", value="-1")
+                        with gr.Row():
+                            frame_pct_a2v = gr.Slider(label="Khung hình trích (%) để nối cảnh",
+                                                       minimum=50, maximum=100, step=5, value=95)
+                            vram_a2v      = gr.Checkbox(label="🧊 Low VRAM Mode", value=False)
+
+                        # --- LoRA ---
+                        lora1_a2v, lora1_str_a2v, lora2_a2v, lora2_str_a2v = \
+                            _lora_controls_block(_DEFAULT_DISTILLED_LORA or NO_LORA_LABEL)
+
+                        # --- IC-LoRA ---
+                        gr.Markdown("**🧬 IC-LoRA Ingredients (tuỳ chọn — cần ảnh tham khảo nhân vật)**")
+                        char_ref_a2v = gr.Image(
+                            label="Ảnh tham khảo nhân vật (IC-LoRA)",
+                            type="filepath", sources=["upload", "clipboard"],
+                        )
+                        with gr.Row():
+                            ic_lora_a2v     = gr.Dropdown(label="File IC-LoRA",
+                                                           choices=list_available_loras(),
+                                                           value=default_ic_lora_choice(), scale=3)
+                            ic_lora_str_a2v = gr.Slider(label="Cường độ", minimum=0.0, maximum=2.0,
+                                                         step=0.05, value=1.0, scale=2)
+                        ic_guide_a2v = gr.Slider(label="Guide strength", minimum=0.0, maximum=1.0,
+                                                  step=0.05, value=1.0)
+
+                with gr.Column(scale=5):
+                    with gr.Group(elem_classes="output-card"):
+                        gallery_a2v    = gr.Gallery(label="🎥 Các Cảnh Lẻ", columns=2, height="auto")
+                        video_out_a2v  = gr.Video(label="🎬 Video Hoàn Chỉnh (đã đồng bộ audio gốc)")
+                        with gr.Row():
+                            btn_a2v   = gr.Button("🎵 Tạo A2V Storyboard", variant="primary")
+                            clear_a2v = gr.Button("🗑️ Clear")
+                        status_a2v = gr.Textbox(label="ℹ️ Status", interactive=False, lines=3,
+                                                 elem_classes="status-box")
+
+            prompt_a2v.change(
+                fn=lambda t: f"🔹 **Số phân cảnh:** {len(split_prompts(t))}",
+                inputs=[prompt_a2v],
+                outputs=[scene_count_a2v],
+            )
+            btn_a2v.click(
+                fn=generate_a2v_storyboard_gradio,
+                inputs=[audio_a2v, img_a2v, prompt_a2v, ratio_a2v, length_a2v, fps_a2v,
+                        seed_a2v, vram_a2v, frame_pct_a2v, image_strength_a2v,
+                        lora1_a2v, lora1_str_a2v, lora2_a2v, lora2_str_a2v,
+                        char_ref_a2v, ic_lora_a2v, ic_lora_str_a2v, ic_guide_a2v],
+                outputs=[gallery_a2v, video_out_a2v, status_a2v],
+            )
+            clear_a2v.click(
+                fn=lambda: (None, None, None, "", "🔹 **Số phân cảnh:** 0"),
+                outputs=[gallery_a2v, video_out_a2v, audio_a2v, status_a2v, scene_count_a2v],
             )
 
 # Khởi chạy Gradio
