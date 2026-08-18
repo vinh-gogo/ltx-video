@@ -81,7 +81,7 @@ AUTH_HEADER = f"Authorization: Bearer {HF_TOKEN}"
 # Bật/tắt việc tải LoRA giữ nhân vật. Để False nếu bạn chỉ muốn dùng bản gốc
 # không LoRA, hoặc muốn tự upload LoRA của riêng bạn (đã train từ nhân vật cụ
 # thể) thẳng vào /content/ComfyUI/models/loras/ sau này.
-DOWNLOAD_CHARACTER_LORA = True
+DOWNLOAD_CHARACTER_LORA = False
 
 # --------------------------------------------------------------------------
 # [1/4] Cài thư viện lõi + clone/cập nhật ComfyUI
@@ -168,6 +168,14 @@ SPATIAL_UPSCALER_FILENAME = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safeten
 CHARACTER_LORA_REPO = "Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients"
 CHARACTER_LORA_FILENAME = "ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors"
 
+# LoRA distilled chính thức của Lightricks cho LTX-2.5 (bf16, checkpoint 450).
+# Dùng như LoRA #1/#2 thông thường (LoraLoaderModelOnly) — KHÔNG phải IC-LoRA
+# Ingredients (không cần ảnh tham khảo). Repo: Lightricks/LTX-2.5-Diffusers.
+# Bật True để tải tự động; False nếu bạn không cần hoặc muốn tải thủ công.
+DOWNLOAD_DISTILLED_LORA = True
+DISTILLED_LORA_REPO = "Lightricks/LTX-2.5-Diffusers"
+DISTILLED_LORA_FILENAME = "ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
+
 
 def dl(url, dest, fname, connections=8, gated=False):
     """Tải 1 file bằng aria2c nếu chưa có. An toàn để gọi song song từ nhiều thread.
@@ -239,6 +247,16 @@ else:
         "/content/ComfyUI/models/loras/ rồi chọn trong dropdown ở Cell 2.",
         color="#90caf9")
 
+if DOWNLOAD_DISTILLED_LORA:
+    DOWNLOAD_JOBS.append((
+        f"https://huggingface.co/{DISTILLED_LORA_REPO}/resolve/main/{DISTILLED_LORA_FILENAME}",
+        "/content/ComfyUI/models/loras", DISTILLED_LORA_FILENAME, True,
+    ))
+else:
+    log("ℹ️ DOWNLOAD_DISTILLED_LORA=False -> bỏ qua tải LoRA distilled chính thức. "
+        "Tự copy vào /content/ComfyUI/models/loras/ nếu cần.",
+        color="#90caf9")
+
 # Tải tối đa 3 file cùng lúc, 8 luồng/file.
 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
     futures = [executor.submit(dl, url, dest, fname, 8, gated) for url, dest, fname, gated in DOWNLOAD_JOBS]
@@ -253,6 +271,9 @@ if _FAILED_DOWNLOADS:
         lora_hint = (f"<br>⚠️ Riêng LoRA giữ nhân vật cần bạn bấm 'Agree and access repository' tại "
                      f"https://huggingface.co/{CHARACTER_LORA_REPO} (đây là license RIÊNG, khác với "
                      f"license của Lightricks/LTX-2.5).")
+    if DOWNLOAD_DISTILLED_LORA and DISTILLED_LORA_FILENAME in _FAILED_DOWNLOADS:
+        lora_hint += (f"<br>⚠️ Riêng LoRA distilled chính thức cần bạn bấm 'Agree and access repository' tại "
+                      f"https://huggingface.co/{DISTILLED_LORA_REPO}.")
     log(f"⚠️ {len(_FAILED_DOWNLOADS)} file tải lỗi: {', '.join(_FAILED_DOWNLOADS)}. "
         f"Kiểm tra HF_TOKEN + đã accept license repo chưa, rồi chạy lại cell này "
         f"(file đã tải xong sẽ tự bỏ qua) trước khi qua Cell 2.{lora_hint}",
@@ -265,11 +286,18 @@ else:
         if DOWNLOAD_CHARACTER_LORA else
         "<br>ℹ️ Chưa tải LoRA giữ nhân vật (đã tắt DOWNLOAD_CHARACTER_LORA)."
     )
+    distilled_lora_note = (
+        "<br>🚀 LoRA distilled chính thức (<code>ltx-2.5-22b-distilled-lora-450-bf16</code>) đã sẵn sàng "
+        "trong <code>models/loras/</code> — chọn ở LoRA #1 trong Cell 2, cường độ khuyến nghị: 1.0."
+        if DOWNLOAD_DISTILLED_LORA else
+        "<br>ℹ️ Chưa tải LoRA distilled chính thức (đã tắt DOWNLOAD_DISTILLED_LORA)."
+    )
     display(HTML(
         "<div style='padding:15px;background-color:#e8f5e9;border-left:5px solid #4caf50;"
         "border-radius:4px;color:#2e7d32;font-family:sans-serif;'>"
         "<b>✨ Initialization Complete!</b> Môi trường LTX-2.5 đã sẵn sàng."
         f"{lora_note}"
+        f"{distilled_lora_note}"
         "<br><small>⚠️ Nhắc lại: transformer + text encoder chính ~37GB VRAM/weights — "
         "cần GPU 24GB+ (L4/A100). Trên T4 16GB nhiều khả năng sẽ OOM dù bật Low VRAM Mode.</small>"
         "<br><small>⚠️ LoRA Ingredients được train trên LTX-2.3; Lightricks xác nhận đa số "
@@ -310,7 +338,8 @@ TEXT_ENCODER_FILENAME = globals().get("TEXT_ENCODER_FILENAME", "gemma4-12b-with-
 VIDEO_VAE_FILENAME = globals().get("VIDEO_VAE_FILENAME", "ltx-2.5-video-vae-bf16.safetensors")
 AUDIO_VAE_FILENAME = globals().get("AUDIO_VAE_FILENAME", "ltx-2.5-audio-vae-bf16.safetensors")
 SPATIAL_UPSCALER_FILENAME = globals().get("SPATIAL_UPSCALER_FILENAME", "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors")
-_DEFAULT_CHARACTER_LORA = globals().get("CHARACTER_LORA_FILENAME", None)  # do Cell 1 tải, nếu có
+_DEFAULT_CHARACTER_LORA = globals().get("CHARACTER_LORA_FILENAME", None)   # do Cell 1 tải, nếu có
+_DEFAULT_DISTILLED_LORA = globals().get("DISTILLED_LORA_FILENAME", None)   # LoRA distilled chính thức, nếu Cell 1 đã tải
 
 MAX_FLF_SB_SCENES = 20
 LATENT_GROUP_FRAMES = 8
@@ -1572,7 +1601,7 @@ with gr.Blocks(
                                                         step=0.05, value=0.7,
                                                         info="Tăng gần 1.0 để giữ nhân vật/bối cảnh sát ảnh gốc hơn xuyên suốt 10s")
 
-                        lora1_i2v, lora1_str_i2v, lora2_i2v, lora2_str_i2v = _lora_controls_block(NO_LORA_LABEL)
+                        lora1_i2v, lora1_str_i2v, lora2_i2v, lora2_str_i2v = _lora_controls_block(_DEFAULT_DISTILLED_LORA or NO_LORA_LABEL)
 
                         gr.Markdown("**🎤 Khoá giọng nói (thử nghiệm)**",
                                     elem_id="voice-lock-i2v")
@@ -1665,7 +1694,7 @@ with gr.Blocks(
                                                         step=0.05, value=0.7,
                                                         info="Tăng gần 1.0 để mỗi cảnh bám sát ảnh gốc/ảnh tham khảo hơn")
 
-                        lora1_seq, lora1_str_seq, lora2_seq, lora2_str_seq = _lora_controls_block(NO_LORA_LABEL)
+                        lora1_seq, lora1_str_seq, lora2_seq, lora2_str_seq = _lora_controls_block(_DEFAULT_DISTILLED_LORA or NO_LORA_LABEL)
 
                         vram_seq = gr.Checkbox(label="🧊 Low VRAM Mode", value=True)
 
@@ -1779,7 +1808,7 @@ with gr.Blocks(
                                                           step=0.05, value=0.7,
                                                           info="Áp dụng cho các cảnh chỉ có Ảnh Đầu (chế độ I2V)")
 
-                        lora1_flfsb, lora1_str_flfsb, lora2_flfsb, lora2_str_flfsb = _lora_controls_block(NO_LORA_LABEL)
+                        lora1_flfsb, lora1_str_flfsb, lora2_flfsb, lora2_str_flfsb = _lora_controls_block(_DEFAULT_DISTILLED_LORA or NO_LORA_LABEL)
 
                         vram_flfsb = gr.Checkbox(label="🧊 Low VRAM Mode", value=False)
 
