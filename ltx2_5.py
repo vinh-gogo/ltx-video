@@ -87,6 +87,7 @@ def _get_custom_nodes_mtime():
 
 
 def ensure_server(low_vram, boot_timeout=300):
+    _WORKFLOW_WARNINGS.clear()  # xoá warnings cũ từ lần generate trước
     current_mtime = _get_custom_nodes_mtime()
     need_restart = (
         not is_server_running()
@@ -117,7 +118,43 @@ def force_restart_server():
     os.system("fuser -k 8188/tcp")
     time.sleep(2)
     _SERVER_STATE["running_low_vram"] = None
+    _SERVER_STATE["custom_nodes_mtime"] = None  # buộc reload custom nodes sau khi restart
+    _AVAILABLE_NODES.clear()                     # xoá cache node để check lại sau khi boot
     return "✅ Đã tắt server cũ để giải phóng VRAM. Lần tạo video tiếp theo sẽ tự khởi động lại."
+
+
+# Cache danh sách node thực tế mà ComfyUI đang load (key = class_type).
+# Được điền lần đầu khi cần, reset mỗi khi server restart.
+_AVAILABLE_NODES: set = set()
+
+
+def _get_available_nodes() -> set:
+    """Query /object_info một lần, cache kết quả. Trả về set class_type đang
+    được ComfyUI load — dùng để kiểm tra node có tồn tại trước khi submit
+    workflow, tránh lỗi 'missing_node_type' mơ hồ."""
+    if _AVAILABLE_NODES:
+        return _AVAILABLE_NODES
+    try:
+        resp = urllib.request.urlopen(
+            urllib.request.Request("http://127.0.0.1:8188/object_info"), timeout=15
+        )
+        info = json.loads(resp.read())
+        _AVAILABLE_NODES.update(info.keys())
+    except Exception:
+        pass  # server chưa sẵn sàng — để trống, sẽ retry lần sau
+    return _AVAILABLE_NODES
+
+
+def _check_ic_lora_nodes_available() -> bool:
+    """Trả về True nếu cả 2 node IC-LoRA chuyên dụng (LTXICLoRALoaderModelOnly
+    và LTXAddVideoICLoRAGuide) đều có trong ComfyUI đang chạy."""
+    nodes = _get_available_nodes()
+    return "LTXICLoRALoaderModelOnly" in nodes and "LTXAddVideoICLoRAGuide" in nodes
+
+
+# Danh sách cảnh báo tích luỹ trong quá trình build workflow (vd khi phải
+# fallback IC-LoRA). Được xoá trước mỗi lần generate, hiển thị trong log UI.
+_WORKFLOW_WARNINGS: list = []
 
 
 def snap_fps_safe(fps):
@@ -381,6 +418,27 @@ def apply_ic_lora_ingredients(wf, model_source, positive_ref, negative_ref, late
     """
     if not ic_lora_name or ic_lora_name == NO_LORA_LABEL or not ref_image_name:
         return model_source, positive_ref, negative_ref, latent_ref
+
+    # Nếu custom node ComfyUI-LTXVideo chưa install/load đúng → tự động
+    # fallback về LoraLoaderModelOnly thông thường (vẫn nạp được weights LoRA,
+    # chỉ thiếu attention guide từ ảnh tham khảo) thay vì crash. Ghi warning
+    # vào _WORKFLOW_WARNINGS để hiển thị trong log UI.
+    if not _check_ic_lora_nodes_available():
+        missing = [n for n in ("LTXICLoRALoaderModelOnly", "LTXAddVideoICLoRAGuide")
+                   if n not in _get_available_nodes()]
+        _WORKFLOW_WARNINGS.append(
+            f"⚠️ IC-LoRA fallback: node {missing} chưa có trong ComfyUI "
+            f"(cần cập nhật ComfyUI-LTXVideo + restart server). "
+            f"Đang dùng LoraLoaderModelOnly thay thế — weights LoRA vẫn được nạp "
+            f"nhưng attention conditioning từ ảnh tham khảo sẽ không hoạt động."
+        )
+        # Fallback: nạp weights LoRA qua node chuẩn, bỏ qua guide
+        node_id = str(start_id)
+        wf[node_id] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": model_source, "lora_name": ic_lora_name, "strength_model": float(ic_lora_strength)},
+        }
+        return [node_id, 0], positive_ref, negative_ref, latent_ref
 
     node_loader = str(start_id)
     node_load_img = str(start_id + 1)
@@ -661,7 +719,14 @@ def build_flf2v_workflow(*, first_image_name, last_image_name, prompt_text, nega
 
 
 def submit_and_wait(workflow, scene_label="", max_wait_seconds=1800, poll_interval=2):
+    # In cảnh báo tích luỹ từ bước build workflow (vd IC-LoRA fallback) trước
+    # khi gửi job — đảm bảo chúng luôn xuất hiện trong log Colab/Gradio.
+    if _WORKFLOW_WARNINGS:
+        for w in _WORKFLOW_WARNINGS:
+            print(w)
+        _WORKFLOW_WARNINGS.clear()
     data = json.dumps({"prompt": workflow}).encode("utf-8")
+
     req = urllib.request.Request("http://127.0.0.1:8188/prompt", data=data)
     try:
         response = urllib.request.urlopen(req, timeout=30)
