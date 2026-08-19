@@ -1,312 +1,4 @@
-# @title [Cell 1] Cài đặt môi trường ComfyUI + LTX-2.5
-
-import concurrent.futures
-import os
-import subprocess
-import threading
-import time
-from getpass import getpass
-from pathlib import Path
-from IPython.display import display, HTML
-
-
-def log(msg, color="#00e676"):
-    display(HTML(f"<p style='color:{color}; font-weight:bold;'>{msg}</p>"))
-
-
-def sh(cmd):
-    """Chạy 1 lệnh shell, in trực tiếp output (không nuốt log) để thấy tiến trình thật."""
-    get_ipython().system(cmd)
-
-
-def pip_install(pkgs, use_uv=True):
-    """Cài package bằng uv (nhanh hơn pip resolver gốc rất nhiều). Tự fallback về pip nếu uv lỗi."""
-    if use_uv:
-        ret = os.system(f"uv pip install -q --system {pkgs}")
-        if ret == 0:
-            return
-        log(f"⚠️ uv lỗi, fallback sang pip cho: {pkgs}", color="#ffb300")
-    os.system(f"pip install -q {pkgs}")
-
-
-def torch_cuda_ready():
-    """Kiểm tra Colab đã có sẵn torch bản GPU chưa, để tránh tải lại ~2-4GB không cần thiết."""
-    try:
-        import torch
-        return torch.cuda.is_available()
-    except Exception:
-        return False
-
-
-# --------------------------------------------------------------------------
-# [0/4] Lấy Hugging Face Access Token — BẮT BUỘC vì Lightricks/LTX-2.5 (và
-# LoRA Ingredients bên dưới) đều bị gate
-# --------------------------------------------------------------------------
-log("[0/4] Kiểm tra Hugging Face Access Token...")
-
-HF_TOKEN = None
-try:
-    from google.colab import userdata  # chỉ có trong môi trường Colab
-    HF_TOKEN = userdata.get("HF_TOKEN")
-    if HF_TOKEN:
-        log("✅ Đã lấy HF_TOKEN từ Colab Secrets (biểu tượng 🔑 bên trái).")
-except Exception:
-    pass
-
-if not HF_TOKEN:
-    HF_TOKEN = os.environ.get("HF_TOKEN")
-
-if not HF_TOKEN:
-    log(
-        "🔑 Chưa tìm thấy HF_TOKEN. Dán access token của bạn vào ô bên dưới "
-        "(token này KHÔNG hiển thị ra màn hình). Lấy token tại: "
-        "https://huggingface.co/settings/tokens — và nhớ bấm 'Agree and access "
-        "repository' tại CẢ HAI trang sau trước khi chạy tiếp:\n"
-        "  1) https://huggingface.co/Lightricks/LTX-2.5\n"
-        "  2) https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients "
-        "(nếu muốn dùng LoRA giữ nhân vật ở bước [3/4] bên dưới)",
-        color="#ffb300",
-    )
-    HF_TOKEN = getpass("Dán Hugging Face token rồi nhấn Enter: ").strip()
-
-if not HF_TOKEN:
-    raise RuntimeError(
-        "❌ Không có HF_TOKEN thì không tải được model LTX-2.5 (repo bị gate). "
-        "Hãy chạy lại cell và dán token hợp lệ."
-    )
-
-os.environ["HF_TOKEN"] = HF_TOKEN
-AUTH_HEADER = f"Authorization: Bearer {HF_TOKEN}"
-
-# Bật/tắt việc tải LoRA giữ nhân vật. Để False nếu bạn chỉ muốn dùng bản gốc
-# không LoRA, hoặc muốn tự upload LoRA của riêng bạn (đã train từ nhân vật cụ
-# thể) thẳng vào /content/ComfyUI/models/loras/ sau này.
-DOWNLOAD_CHARACTER_LORA = False
-
-# --------------------------------------------------------------------------
-# [1/4] Cài thư viện lõi + clone/cập nhật ComfyUI
-# --------------------------------------------------------------------------
-log("[1/4] Installing core dependencies...")
-sh("pip install -q uv")  # cài uv trước, dùng cho mọi bước pip install sau này
-
-if torch_cuda_ready():
-    import torch
-    log(f"✅ Đã có sẵn Torch {torch.__version__} (CUDA) -> bỏ qua cài lại, tiết kiệm ~2-4 phút")
-else:
-    log("⏳ Chưa có Torch CUDA sẵn -> đang cài (bước này thường lâu nhất)...")
-    pip_install("torch torchvision torchaudio")
-
-pip_install(
-    "torchsde einops diffusers accelerate av spandrel albumentations "
-    "onnx opencv-python onnxruntime tqdm ipywidgets"
-)
-
-if not os.path.exists("/content/ComfyUI"):
-    sh("git clone -q https://github.com/comfyanonymous/ComfyUI")
-else:
-    log("🔄 ComfyUI đã tồn tại -> git pull để lấy bản mới nhất (LTX-2.5 cần bản nightly)...")
-    sh("cd /content/ComfyUI && git pull -q")
-pip_install("-r /content/ComfyUI/requirements.txt")
-sh("apt-get -y install -qq aria2 > /dev/null 2>&1")
-
-# --------------------------------------------------------------------------
-# [2/4] Clone/cập nhật custom nodes
-# --------------------------------------------------------------------------
-# LƯU Ý: các node lõi của pipeline LTX-2.5 (LTXVAddGuide, LTXVConcatAVLatent,
-# LTXVSeparateAVLatent, LTXVAudioVAEDecode...) giờ nằm trong CHÍNH ComfyUI
-# core (cnr_id "comfy-core"), không còn phụ thuộc custom node ComfyUI-LTXVideo
-# để hoạt động cơ bản. Vẫn giữ lại các custom node bên dưới vì: KJNodes vẫn
-# cần cho preview/tiny-VAE, ComfyUI-LTXVideo vẫn cần cho IC-LoRA control
-# (canny/depth/HDR...) nếu bạn dùng sau này, VideoHelperSuite cần cho việc
-# xử lý video. ComfyUI-GGUF được giữ lại (không bắt buộc với luồng chính
-# int8-convrot) phòng khi bạn muốn thử GGUF quant cộng đồng sau này.
-# LoraLoaderModelOnly (dùng để nạp LoRA giữ nhân vật ở Cell 2) là node LÕI có
-# sẵn trong ComfyUI, KHÔNG cần custom node riêng.
-log("[2/4] Cloning/updating custom nodes...")
-get_ipython().run_line_magic("cd", "-q /content/ComfyUI/custom_nodes")
-
-CUSTOM_NODES = [
-    "https://github.com/kijai/ComfyUI-KJNodes",
-    "https://github.com/city96/ComfyUI-GGUF",
-    "https://github.com/Lightricks/ComfyUI-LTXVideo/",
-    "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
-    "https://github.com/kijai/ComfyUI-MelBandRoFormer",
-]
-for repo_url in CUSTOM_NODES:
-    node_name = repo_url.rstrip("/").split("/")[-1]
-    if os.path.exists(node_name):
-        sh(f"cd {node_name} && git pull -q && cd ..")
-    else:
-        sh(f"git clone -q {repo_url}")
-    req_file = f"{node_name}/requirements.txt"
-    if os.path.exists(req_file):
-        pip_install(f"-r {req_file}")
-
-# --------------------------------------------------------------------------
-# [3/4] Tải model weights cho LTX-2.5 + LoRA giữ nhân vật (song song, có log tiến trình)
-# --------------------------------------------------------------------------
-log("[3/4] Fetching LTX-2.5 model weights (this may take a while — tổng ~40GB)...")
-
-_FAILED_DOWNLOADS = []
-_print_lock = threading.Lock()
-
-# Tên file dùng chung cho toàn bộ notebook — Cell 2 đọc lại các biến này.
-# Cấu hình mặc định: bản "distilled" (đã tối ưu số bước, KHÔNG cần LoRA
-# distill riêng như pipeline LTX-2.3 cũ) — đây là cấu hình ComfyUI chính
-# thức khuyến nghị cho cả 3 workflow T2V/I2V/FLF2V.
-UNET_FILENAME = "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors"
-TEXT_ENCODER_FILENAME = "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors"
-TEXT_ENCODER_ENHANCER_FILENAME = "gemma4_e2b_it_bf16.safetensors"  # dùng riêng cho Prompt Enhancer, không phải dual-clip
-VIDEO_VAE_FILENAME = "ltx-2.5-video-vae-bf16.safetensors"
-AUDIO_VAE_FILENAME = "ltx-2.5-audio-vae-bf16.safetensors"
-SPATIAL_UPSCALER_FILENAME = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
-
-# LoRA giữ đồng bộ nhân vật/props/bối cảnh xuyên suốt (IC-LoRA "Ingredients").
-# Repo: Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients (train trên 2.3, Lightricks
-# xác nhận đa số chạy tốt trên 2.5 nhưng khuyến cáo tự kiểm chứng).
-# Cường độ khuyến nghị chính chủ: strength = 1.0 (Cell 2 đặt sẵn mặc định này).
-CHARACTER_LORA_REPO = "Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients"
-CHARACTER_LORA_FILENAME = "ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors"
-
-# LoRA distilled chính thức của Lightricks cho LTX-2.5 (bf16, checkpoint 450).
-# Dùng như LoRA #1/#2 thông thường (LoraLoaderModelOnly) — KHÔNG phải IC-LoRA
-# Ingredients (không cần ảnh tham khảo). Repo: Lightricks/LTX-2.5-Diffusers.
-# Bật True để tải tự động; False nếu bạn không cần hoặc muốn tải thủ công.
-DOWNLOAD_DISTILLED_LORA = True
-DISTILLED_LORA_REPO = "Lightricks/LTX-2.5-Diffusers"
-DISTILLED_LORA_FILENAME = "ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
-
-
-def dl(url, dest, fname, connections=8, gated=False):
-    """Tải 1 file bằng aria2c nếu chưa có. An toàn để gọi song song từ nhiều thread.
-    gated=True -> gắn header Authorization (bắt buộc cho mọi file trong
-    Lightricks/LTX-2.5 và Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients, vì cả 2
-    repo đều yêu cầu đăng nhập + accept license riêng)."""
-    Path(dest).mkdir(parents=True, exist_ok=True)
-    file_path = os.path.join(dest, fname)
-    if os.path.exists(file_path):
-        with _print_lock:
-            print(f"⏭️  Đã có sẵn, bỏ qua: {fname}")
-        return True
-
-    with _print_lock:
-        print(f"⬇️  Bắt đầu tải: {fname}")
-
-    cmd = [
-        "aria2c", "--console-log-level=warn", "-c",
-        "-x", str(connections), "-s", str(connections), "-k", "1M",
-        "-d", dest, "-o", fname,
-    ]
-    if gated:
-        cmd += ["--header", AUTH_HEADER]
-    cmd.append(url)
-
-    t0 = time.time()
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    elapsed = max(time.time() - t0, 0.01)
-    ok = result.returncode == 0 and os.path.exists(file_path)
-
-    with _print_lock:
-        if ok:
-            size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            print(f"✅ Xong: {fname}  ({size_mb:.0f}MB trong {elapsed:.0f}s, ~{size_mb / elapsed:.1f}MB/s)")
-        else:
-            _FAILED_DOWNLOADS.append(fname)
-            hint = ""
-            if gated and ("401" in (result.stderr or "") or "403" in (result.stderr or "")):
-                hint = (" (lỗi xác thực — kiểm tra lại HF_TOKEN và đã bấm 'Agree and access "
-                        "repository' đúng trang repo của file này chưa)")
-            print(f"⚠️ Tải thất bại: {fname}{hint}")
-    return ok
-
-
-# Danh sách file cần tải: (url, thư mục đích, tên file, có bị gate hay không)
-DOWNLOAD_JOBS = [
-    (f"https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/{UNET_FILENAME}",
-     "/content/ComfyUI/models/diffusion_models", UNET_FILENAME, True),
-    (f"https://huggingface.co/Lightricks/LTX-2.5/resolve/main/text_encoders/{TEXT_ENCODER_FILENAME}",
-     "/content/ComfyUI/models/text_encoders", TEXT_ENCODER_FILENAME, True),
-    (f"https://huggingface.co/Comfy-Org/gemma-4/resolve/main/text_encoders/{TEXT_ENCODER_ENHANCER_FILENAME}",
-     "/content/ComfyUI/models/text_encoders", TEXT_ENCODER_ENHANCER_FILENAME, False),
-    (f"https://huggingface.co/Lightricks/LTX-2.5/resolve/main/vae/{VIDEO_VAE_FILENAME}",
-     "/content/ComfyUI/models/vae", VIDEO_VAE_FILENAME, True),
-    (f"https://huggingface.co/Lightricks/LTX-2.5/resolve/main/vae/{AUDIO_VAE_FILENAME}",
-     "/content/ComfyUI/models/vae", AUDIO_VAE_FILENAME, True),
-    (f"https://huggingface.co/Lightricks/LTX-2.5/resolve/main/latent_upscale_models/{SPATIAL_UPSCALER_FILENAME}",
-     "/content/ComfyUI/models/latent_upscale_models", SPATIAL_UPSCALER_FILENAME, True),
-]
-
-if DOWNLOAD_CHARACTER_LORA:
-    DOWNLOAD_JOBS.append((
-        f"https://huggingface.co/{CHARACTER_LORA_REPO}/resolve/main/{CHARACTER_LORA_FILENAME}",
-        "/content/ComfyUI/models/loras", CHARACTER_LORA_FILENAME, True,
-    ))
-else:
-    log("ℹ️ DOWNLOAD_CHARACTER_LORA=False -> bỏ qua tải LoRA giữ nhân vật. "
-        "Bạn có thể tự copy LoRA .safetensors của mình vào "
-        "/content/ComfyUI/models/loras/ rồi chọn trong dropdown ở Cell 2.",
-        color="#90caf9")
-
-if DOWNLOAD_DISTILLED_LORA:
-    DOWNLOAD_JOBS.append((
-        f"https://huggingface.co/{DISTILLED_LORA_REPO}/resolve/main/{DISTILLED_LORA_FILENAME}",
-        "/content/ComfyUI/models/loras", DISTILLED_LORA_FILENAME, True,
-    ))
-else:
-    log("ℹ️ DOWNLOAD_DISTILLED_LORA=False -> bỏ qua tải LoRA distilled chính thức. "
-        "Tự copy vào /content/ComfyUI/models/loras/ nếu cần.",
-        color="#90caf9")
-
-# Tải tối đa 3 file cùng lúc, 8 luồng/file.
-with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-    futures = [executor.submit(dl, url, dest, fname, 8, gated) for url, dest, fname, gated in DOWNLOAD_JOBS]
-    concurrent.futures.wait(futures)
-
-# --------------------------------------------------------------------------
-# [4/4] Tổng kết
-# --------------------------------------------------------------------------
-if _FAILED_DOWNLOADS:
-    lora_hint = ""
-    if DOWNLOAD_CHARACTER_LORA and CHARACTER_LORA_FILENAME in _FAILED_DOWNLOADS:
-        lora_hint = (f"<br>⚠️ Riêng LoRA giữ nhân vật cần bạn bấm 'Agree and access repository' tại "
-                     f"https://huggingface.co/{CHARACTER_LORA_REPO} (đây là license RIÊNG, khác với "
-                     f"license của Lightricks/LTX-2.5).")
-    if DOWNLOAD_DISTILLED_LORA and DISTILLED_LORA_FILENAME in _FAILED_DOWNLOADS:
-        lora_hint += (f"<br>⚠️ Riêng LoRA distilled chính thức cần bạn bấm 'Agree and access repository' tại "
-                      f"https://huggingface.co/{DISTILLED_LORA_REPO}.")
-    log(f"⚠️ {len(_FAILED_DOWNLOADS)} file tải lỗi: {', '.join(_FAILED_DOWNLOADS)}. "
-        f"Kiểm tra HF_TOKEN + đã accept license repo chưa, rồi chạy lại cell này "
-        f"(file đã tải xong sẽ tự bỏ qua) trước khi qua Cell 2.{lora_hint}",
-        color="#ff5252")
-else:
-    lora_note = (
-        "<br>🎭 LoRA giữ nhân vật (Ingredients IC-LoRA) đã sẵn sàng trong "
-        "<code>models/loras/</code> — chọn nó ở mục '🎭 LoRA giữ nhân vật/phong cách' trong Cell 2. "
-        "Cường độ khuyến nghị: 1.0."
-        if DOWNLOAD_CHARACTER_LORA else
-        "<br>ℹ️ Chưa tải LoRA giữ nhân vật (đã tắt DOWNLOAD_CHARACTER_LORA)."
-    )
-    distilled_lora_note = (
-        "<br>🚀 LoRA distilled chính thức (<code>ltx-2.5-22b-distilled-lora-450-bf16</code>) đã sẵn sàng "
-        "trong <code>models/loras/</code> — chọn ở LoRA #1 trong Cell 2, cường độ khuyến nghị: 1.0."
-        if DOWNLOAD_DISTILLED_LORA else
-        "<br>ℹ️ Chưa tải LoRA distilled chính thức (đã tắt DOWNLOAD_DISTILLED_LORA)."
-    )
-    display(HTML(
-        "<div style='padding:15px;background-color:#e8f5e9;border-left:5px solid #4caf50;"
-        "border-radius:4px;color:#2e7d32;font-family:sans-serif;'>"
-        "<b>✨ Initialization Complete!</b> Môi trường LTX-2.5 đã sẵn sàng."
-        f"{lora_note}"
-        f"{distilled_lora_note}"
-        "<br><small>⚠️ Nhắc lại: transformer + text encoder chính ~37GB VRAM/weights — "
-        "cần GPU 24GB+ (L4/A100). Trên T4 16GB nhiều khả năng sẽ OOM dù bật Low VRAM Mode.</small>"
-        "<br><small>⚠️ LoRA Ingredients được train trên LTX-2.3; Lightricks xác nhận đa số "
-        "LoRA/IC-LoRA 2.3 chạy được trên 2.5 nhưng khuyến cáo tự kiểm chứng chất lượng trước khi "
-        "dùng cho công việc quan trọng.</small>"
-        "</div>"
-    ))
-
-# @title [Cell 2] LTX-2.5 AI Video Studio — v0.5.0
+# @title [Cell 2] LTX-2.5 — v0.5.3
 
 get_ipython().system("pip install -q gradio opencv-python")
 
@@ -338,8 +30,7 @@ TEXT_ENCODER_FILENAME = globals().get("TEXT_ENCODER_FILENAME", "gemma4-12b-with-
 VIDEO_VAE_FILENAME = globals().get("VIDEO_VAE_FILENAME", "ltx-2.5-video-vae-bf16.safetensors")
 AUDIO_VAE_FILENAME = globals().get("AUDIO_VAE_FILENAME", "ltx-2.5-audio-vae-bf16.safetensors")
 SPATIAL_UPSCALER_FILENAME = globals().get("SPATIAL_UPSCALER_FILENAME", "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors")
-_DEFAULT_CHARACTER_LORA = globals().get("CHARACTER_LORA_FILENAME", None)   # do Cell 1 tải, nếu có
-_DEFAULT_DISTILLED_LORA = globals().get("DISTILLED_LORA_FILENAME", None)   # LoRA distilled chính thức, nếu Cell 1 đã tải
+_DEFAULT_CHARACTER_LORA = globals().get("CHARACTER_LORA_FILENAME", None)  # do Cell 1 tải, nếu có
 
 MAX_FLF_SB_SCENES = 20
 LATENT_GROUP_FRAMES = 8
@@ -369,37 +60,48 @@ def is_server_running(port=8188):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-_SERVER_STATE = {"running_low_vram": None}
-_COMFY_NODES = None  # cache danh sách node ComfyUI, reset khi server restart
+_SERVER_STATE = {"running_low_vram": None, "custom_nodes_mtime": None}
 
 
-def _get_comfy_nodes():
-    """Lazy-load danh sách node types từ ComfyUI API (gọi 1 lần/session).
-    Trả về set tên node, hoặc set rỗng nếu không lấy được."""
-    global _COMFY_NODES
-    if _COMFY_NODES is None:
-        try:
-            resp = urllib.request.urlopen(
-                urllib.request.Request("http://127.0.0.1:8188/object_info"), timeout=10)
-            _COMFY_NODES = set(json.loads(resp.read()).keys())
-        except Exception:
-            _COMFY_NODES = set()
-    return _COMFY_NODES
+def _get_custom_nodes_mtime():
+    """Lấy mtime mới nhất trong thư mục custom_nodes để phát hiện khi nào
+    Cell 1 vừa clone/update custom node mới (vd sau git pull ComfyUI-LTXVideo
+    thêm node LTXICLoRALoaderModelOnly). Server đang chạy sẽ bị restart để
+    load lại toàn bộ custom nodes — tránh lỗi 'Node not found'."""
+    cn_dir = "/content/ComfyUI/custom_nodes"
+    try:
+        mtimes = []
+        for entry in os.scandir(cn_dir):
+            mtimes.append(entry.stat().st_mtime)
+            if entry.is_dir():
+                # Check thêm 1 level sâu hơn (file .py của node quan trọng)
+                try:
+                    for sub in os.scandir(entry.path):
+                        if sub.name.endswith(".py"):
+                            mtimes.append(sub.stat().st_mtime)
+                except OSError:
+                    pass
+        return max(mtimes) if mtimes else 0.0
+    except OSError:
+        return 0.0
 
 
 def ensure_server(low_vram, boot_timeout=300):
-    global _COMFY_NODES
-    need_restart = (not is_server_running()) or (_SERVER_STATE["running_low_vram"] != low_vram)
+    current_mtime = _get_custom_nodes_mtime()
+    need_restart = (
+        not is_server_running()
+        or _SERVER_STATE["running_low_vram"] != low_vram
+        or _SERVER_STATE["custom_nodes_mtime"] != current_mtime
+    )
     if not need_restart:
         return
     os.system("fuser -k 8188/tcp")
     time.sleep(2)
-    _COMFY_NODES = None  # reset node cache sau khi server restart
     os.chdir("/content/ComfyUI")
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     cmd = ["python", "main.py"]
     if low_vram:
-        cmd.append("--cache-none")
+        cmd.insert(2, "--cache-none")
     subprocess.Popen(cmd)
     waited = 0
     while not is_server_running():
@@ -408,14 +110,13 @@ def ensure_server(low_vram, boot_timeout=300):
         if waited > boot_timeout:
             raise RuntimeError(f"Server không khởi động được sau {boot_timeout}s. Kiểm tra lại /content/ComfyUI.")
     _SERVER_STATE["running_low_vram"] = low_vram
+    _SERVER_STATE["custom_nodes_mtime"] = current_mtime
 
 
 def force_restart_server():
-    global _COMFY_NODES
     os.system("fuser -k 8188/tcp")
     time.sleep(2)
     _SERVER_STATE["running_low_vram"] = None
-    _COMFY_NODES = None  # reset node cache
     return "✅ Đã tắt server cũ để giải phóng VRAM. Lần tạo video tiếp theo sẽ tự khởi động lại."
 
 
@@ -522,20 +223,13 @@ def update_storyboard_flf_ui(text):
     return [msg] + first_updates + last_updates
 
 
-_ASPECT_RATIO_MAP = {
-    "480x832": (480, 832),
-    "832x480": (832, 480),
-    "1280x720": (1280, 720),
-    "720x1280": (720, 1280),
-    "720x720": (720, 720),
-}
-
-
 def parse_aspect_ratio(ratio_str):
-    for key, dims in _ASPECT_RATIO_MAP.items():
-        if key in ratio_str:
-            return dims
-    return 512, 512
+    if "480x832" in ratio_str: return 480, 832
+    elif "832x480" in ratio_str: return 832, 480
+    elif "1280x720" in ratio_str: return 1280, 720
+    elif "720x1280" in ratio_str: return 720, 1280
+    elif "720x720" in ratio_str: return 720, 720
+    else: return 512, 512
 
 
 def safe_dims(width, height):
@@ -553,7 +247,7 @@ def safe_dims(width, height):
 def get_seed(v_seed):
     try:
         v = int(v_seed)
-    except (TypeError, ValueError):
+    except Exception:
         v = -1
     return random.randint(1, 999999999) if v == -1 else v
 
@@ -639,23 +333,10 @@ def set_audio_ref_tokens(wf, positive_ref, negative_ref, audio_latent_ref, start
     """
     if audio_latent_ref is None:
         return positive_ref, negative_ref, start_id
-    if "LTXVSetAudioRefTokens" not in _get_comfy_nodes():
-        print("⚠️ [Voice Lock] Node 'LTXVSetAudioRefTokens' không có trong ComfyUI "
-              "→ bỏ qua Voice Lock. Hãy bấm '🔄 Restart' rồi thử lại, "
-              "hoặc cập nhật ComfyUI-LTXVideo (cd /content/ComfyUI/custom_nodes/ComfyUI-LTXVideo && git pull).")
-        return positive_ref, negative_ref, start_id
     node_id = str(start_id)
     wf[node_id] = {"class_type": "LTXVSetAudioRefTokens",
                     "inputs": {"positive": positive_ref, "negative": negative_ref, "audio_latent": audio_latent_ref}}
     return [node_id, 0], [node_id, 1], start_id + 1
-
-
-def _is_ic_lora_file(filename):
-    """Kiểm tra (dựa trên tên file) liệu đây có phải IC-LoRA Ingredients của
-    Lightricks không. LoRA thường đặt vào IC-LoRA dropdown sẽ bị bỏ qua thay
-    vì gây lỗi 'LTXICLoRALoaderModelOnly not found'."""
-    name = (filename or "").lower()
-    return "ic-lora" in name or "ic_lora" in name or "ingredients" in name
 
 
 def apply_ic_lora_ingredients(wf, model_source, positive_ref, negative_ref, latent_ref, vae_ref,
@@ -698,7 +379,7 @@ def apply_ic_lora_ingredients(wf, model_source, positive_ref, negative_ref, late
     Nếu thiếu ic_lora_name hoặc thiếu ref_image_name thì trả nguyên các ref
     đầu vào — không đổi hành vi/workflow gốc.
     """
-    if not ic_lora_name or ic_lora_name == NO_LORA_LABEL or not ref_image_name or not _is_ic_lora_file(ic_lora_name):
+    if not ic_lora_name or ic_lora_name == NO_LORA_LABEL or not ref_image_name:
         return model_source, positive_ref, negative_ref, latent_ref
 
     node_loader = str(start_id)
@@ -979,308 +660,6 @@ def build_flf2v_workflow(*, first_image_name, last_image_name, prompt_text, nega
     return wf
 
 
-# ==========================================================================
-# A2V — AUDIO-TO-VIDEO HELPER FUNCTIONS
-# ==========================================================================
-
-def _get_audio_duration(audio_path):
-    """Lấy độ dài audio (giây) bằng ffprobe. Trả về 0.0 nếu lỗi."""
-    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-           "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        return float(result.stdout.strip())
-    except Exception:
-        return 0.0
-
-
-def _extract_audio_segment(audio_path, start_sec, duration_sec, output_path):
-    """Cắt 1 đoạn audio [start_sec, start_sec+duration_sec] ra file WAV.
-    Nếu audio ngắn hơn cần thiết, ffmpeg tự dừng — không báo lỗi.
-    Trả về output_path nếu thành công, None nếu thất bại."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", audio_path,
-        "-ss", str(start_sec), "-t", str(duration_sec),
-        "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1",
-        output_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0 and os.path.exists(output_path):
-        return output_path
-    return None
-
-
-def build_a2v_workflow(*, audio_name, prompt_text, negative_text=NEGATIVE_PROMPT_DEFAULT,
-                        width, height, fps, duration, seed,
-                        image_name=None, image_strength=0.7,
-                        lora1_name=NO_LORA_LABEL, lora1_strength=1.0,
-                        lora2_name=NO_LORA_LABEL, lora2_strength=0.6,
-                        ic_lora_name=NO_LORA_LABEL, ic_lora_strength=1.0,
-                        ic_ref_image_name=None, ic_guide_strength=1.0):
-    """A2V workflow: thay LTXVEmptyLatentAudio bằng LTXVAudioVAEEncode thực tế
-    để model nghe và khớp video với audio đầu vào (lip-sync, nhịp điệu, v.v.).
-    Hỗ trợ cả T2V (image_name=None) và I2V (image_name=tên ảnh).
-    audio_cfg=3.0 (cao hơn T2V/I2V=1.0) để audio dẫn dắt mạnh hơn."""
-    safe_fps = snap_fps_safe(fps)
-    total_frames = total_frames_for(duration, safe_fps)
-    half_w, half_h = half_dims(width, height)
-
-    wf = _clip_text_nodes(prompt_text, negative_text)
-
-    # --- Nodes nền tảng ---
-    wf.update({
-        "4":  {"class_type": "LTXVConditioning",
-               "inputs": {"positive": ["2", 0], "negative": ["3", 0], "frame_rate": float(safe_fps)}},
-        "5":  {"class_type": "UNETLoader",  "inputs": {"unet_name": UNET_FILENAME, "weight_dtype": "default"}},
-        "6":  {"class_type": "VAELoader",   "inputs": {"vae_name": VIDEO_VAE_FILENAME}},
-        "7":  {"class_type": "VAELoader",   "inputs": {"vae_name": AUDIO_VAE_FILENAME}},
-        # Load & encode audio thực tế (node 90-91 tránh đụng node ID với LoRA 100+)
-        "90": {"class_type": "LoadAudio",
-               "inputs": {"audio": audio_name}},
-        "91": {"class_type": "LTXVAudioVAEEncode",
-               "inputs": {"audio": ["90", 0], "audio_vae": ["7", 0]}},
-        # Video latent Pass 1
-        "8":  {"class_type": "EmptyLTXVLatentVideo",
-               "inputs": {"width": half_w, "height": half_h, "length": total_frames, "batch_size": 1}},
-    })
-
-    # --- I2V: gắn ảnh vào latent ---
-    if image_name:
-        wf.update({
-            "30": {"class_type": "LoadImage", "inputs": {"image": image_name}},
-            "31": {"class_type": "ImageResizeKJv2",
-                   "inputs": {"width": width, "height": height, "upscale_method": "lanczos",
-                              "keep_proportion": "crop", "pad_color": "0, 0, 0",
-                              "crop_position": "center", "divisible_by": 32, "device": "cpu",
-                              "image": ["30", 0]}},
-            "32": {"class_type": "LTXVPreprocess", "inputs": {"img_compression": 18, "image": ["31", 0]}},
-            "33": {"class_type": "LTXVImgToVideoInplace",
-                   "inputs": {"vae": ["6", 0], "image": ["32", 0], "latent": ["8", 0],
-                              "strength": float(image_strength), "bypass": False}},
-        })
-        video_latent_p1 = ["33", 0]
-        ic_base_latent   = ["33", 0]
-    else:
-        video_latent_p1 = ["8", 0]
-        ic_base_latent   = ["8", 0]
-
-    # --- Ghép AV latent Pass 1, Sampler, Upscaler, Pass 2, Decode ---
-    wf.update({
-        "10": {"class_type": "LTXVConcatAVLatent",
-               "inputs": {"video_latent": video_latent_p1, "audio_latent": ["91", 0]}},
-        "11": {"class_type": "RandomNoise",     "inputs": {"noise_seed": seed}},
-        "12": {"class_type": "KSamplerSelect",  "inputs": {"sampler_name": "euler_ancestral"}},
-        "13": {"class_type": "ManualSigmas",    "inputs": {"sigmas": SIGMAS_PASS1}},
-        # audio_cfg cao hơn bình thường để audio dẫn dắt mạnh hơn
-        "14": {"class_type": "LTXVDualCFGGuider",
-               "inputs": {"model": ["5", 0], "positive": ["4", 0], "negative": ["4", 1],
-                          "video_cfg": 1.0, "audio_cfg": 3.0}},
-        "15": {"class_type": "SamplerCustomAdvanced",
-               "inputs": {"noise": ["11", 0], "guider": ["14", 0], "sampler": ["12", 0],
-                          "sigmas": ["13", 0], "latent_image": ["10", 0]}},
-        "16": {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["15", 0]}},
-        "17": {"class_type": "LatentUpscaleModelLoader", "inputs": {"model_name": SPATIAL_UPSCALER_FILENAME}},
-        "18": {"class_type": "LTXVLatentUpsampler",
-               "inputs": {"samples": ["16", 0], "upscale_model": ["17", 0], "vae": ["6", 0]}},
-    })
-
-    # Pass 2: I2V → tiêm lại ảnh vào latent upscaled; T2V → ghép thẳng
-    if image_name:
-        wf["34"] = {"class_type": "LTXVImgToVideoInplace",
-                    "inputs": {"vae": ["6", 0], "image": ["32", 0], "latent": ["18", 0],
-                               "strength": 1.0, "bypass": False}}
-        video_latent_p2 = ["34", 0]
-    else:
-        video_latent_p2 = ["18", 0]
-
-    wf.update({
-        "19": {"class_type": "LTXVConcatAVLatent",
-               "inputs": {"video_latent": video_latent_p2, "audio_latent": ["91", 0]}},
-        "20": {"class_type": "RandomNoise",    "inputs": {"noise_seed": PASS2_FIXED_NOISE_SEED}},
-        "21": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler_ancestral"}},
-        "22": {"class_type": "ManualSigmas",   "inputs": {"sigmas": SIGMAS_PASS2}},
-        "23": {"class_type": "LTXVDualCFGGuider",
-               "inputs": {"model": ["5", 0], "positive": ["4", 0], "negative": ["4", 1],
-                          "video_cfg": 1.0, "audio_cfg": 3.0}},
-        "24": {"class_type": "SamplerCustomAdvanced",
-               "inputs": {"noise": ["20", 0], "guider": ["23", 0], "sampler": ["21", 0],
-                          "sigmas": ["22", 0], "latent_image": ["19", 0]}},
-        "25": {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["24", 0]}},
-        "26": {"class_type": "VAEDecodeTiled",
-               "inputs": {"samples": ["25", 0], "vae": ["6", 0],
-                          "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 16}},
-        "27": {"class_type": "LTXVAudioVAEDecode", "inputs": {"samples": ["25", 1], "audio_vae": ["7", 0]}},
-        "28": {"class_type": "CreateVideo",
-               "inputs": {"images": ["26", 0], "audio": ["27", 0], "fps": float(safe_fps)}},
-        "29": {"class_type": "SaveVideo",
-               "inputs": {"video": ["28", 0], "filename_prefix": "video/ltx25_a2v",
-                          "format": "auto", "codec": "auto"}},
-    })
-
-    # --- LoRA thường ---
-    model_ref = apply_lora_stack(wf, ["5", 0], lora1_name, lora1_strength, lora2_name, lora2_strength)
-
-    # --- IC-LoRA Ingredients (chỉ Pass 1) ---
-    model_ref, p1_pos, p1_neg, p1_video_latent = apply_ic_lora_ingredients(
-        wf, model_ref, ["4", 0], ["4", 1], ic_base_latent, ["6", 0],
-        ic_lora_name, ic_lora_strength, ic_ref_image_name, ic_guide_strength)
-
-    wf["10"]["inputs"]["video_latent"] = p1_video_latent
-    wf["14"]["inputs"]["model"]    = model_ref
-    wf["14"]["inputs"]["positive"] = p1_pos
-    wf["14"]["inputs"]["negative"] = p1_neg
-    wf["23"]["inputs"]["model"]    = model_ref
-    return wf
-
-
-# ==========================================================================
-# TAB 4 — A2V Storyboard: Video đồng bộ với Audio xuyên suốt
-# ==========================================================================
-
-def generate_a2v_storyboard_gradio(audio_path, img_path, prompts_text, aspect_ratio,
-                                    v_length, v_fps, v_seed, low_vram, frame_percent,
-                                    image_strength,
-                                    lora1_name, lora1_strength, lora2_name, lora2_strength,
-                                    char_ref_path, ic_lora_name, ic_lora_strength, ic_guide_strength):
-    """Generator: chia audio thành đoạn/cảnh, sinh video A2V từng cảnh,
-    ghép lại và thay audio track bằng audio gốc để đồng bộ hoàn hảo."""
-    if not audio_path:
-        yield None, None, "⚠️ Vui lòng upload file audio (wav/mp3) trước!"
-        return
-    prompts = split_prompts(prompts_text)
-    if not prompts:
-        yield None, None, "⚠️ Vui lòng nhập ít nhất 1 prompt (mỗi cảnh 1 đoạn văn)!"
-        return
-
-    v_length = int(v_length)
-    frame_percent = int(frame_percent)
-    v_width, v_height = parse_aspect_ratio(aspect_ratio)
-    safe_width, safe_height = safe_dims(v_width, v_height)
-    total_scenes = len(prompts)
-    total_needed = total_scenes * v_length
-
-    # Kiểm tra độ dài audio
-    audio_dur = _get_audio_duration(audio_path)
-    dur_note = ""
-    if audio_dur > 0:
-        if audio_dur < total_needed:
-            dur_note = (f" ⚠️ Audio dài {audio_dur:.1f}s < tổng {total_needed}s "
-                        f"({total_scenes} cảnh × {v_length}s) — các cảnh cuối sẽ chạy hết audio.")
-        else:
-            dur_note = f" (audio {audio_dur:.1f}s, lấy {total_needed}s)"
-
-    yield None, None, f"🔄 Khởi động server...{dur_note}"
-    try:
-        ensure_server(low_vram)
-    except Exception as e:
-        yield None, None, f"❌ {e}"
-        return
-
-    base_seed = get_seed(v_seed)
-    yield None, None, (f"✅ Server sẵn sàng. Bắt đầu tạo {total_scenes} cảnh A2V "
-                       f"(Seed: {base_seed}){dur_note}")
-    os.makedirs(INPUT_DIR, exist_ok=True)
-
-    # IC-LoRA reference image
-    ic_ref_img_name = None
-    if char_ref_path:
-        ic_ref_img_name = f"ic_ref_a2v_{int(time.time())}.png"
-        shutil.copy(char_ref_path, os.path.join(INPUT_DIR, ic_ref_img_name))
-
-    generated_videos = []
-    current_img_path = img_path   # None → T2V; có ảnh → I2V
-
-    for i, p in enumerate(prompts):
-        label = f"cảnh {i + 1}/{total_scenes}"
-        start_sec = i * v_length
-
-        # --- Cắt đoạn audio tương ứng ---
-        seg_name = f"a2v_seg_{i}_{int(time.time())}.wav"
-        seg_path = os.path.join(INPUT_DIR, seg_name)
-        extracted = _extract_audio_segment(audio_path, start_sec, v_length, seg_path)
-        if not extracted:
-            yield generated_videos, None, f"⚠️ Không cắt được audio cho {label} (ffmpeg lỗi)!"
-            return
-
-        mode_note = "I2V+A" if current_img_path else "T2V+A"
-        yield (generated_videos, None,
-               f"🔄 [{mode_note}] Đang tạo {label} "
-               f"(audio {start_sec:.0f}s–{start_sec + v_length:.0f}s)...\n📝 {p}")
-
-        # --- Chuẩn bị ảnh (nếu có) ---
-        img_name = None
-        if current_img_path:
-            img_name = f"a2v_frame_{i}_{int(time.time())}.png"
-            shutil.copy(current_img_path, os.path.join(INPUT_DIR, img_name))
-
-        wf = build_a2v_workflow(
-            audio_name=seg_name, prompt_text=p,
-            width=safe_width, height=safe_height,
-            fps=v_fps, duration=v_length, seed=base_seed + i,
-            image_name=img_name, image_strength=image_strength,
-            lora1_name=lora1_name, lora1_strength=lora1_strength,
-            lora2_name=lora2_name, lora2_strength=lora2_strength,
-            ic_lora_name=ic_lora_name, ic_lora_strength=ic_lora_strength,
-            ic_ref_image_name=ic_ref_img_name, ic_guide_strength=ic_guide_strength,
-        )
-
-        try:
-            submit_and_wait(wf, scene_label=label)
-        except Exception as e:
-            yield generated_videos, None, f"❌ {e}"
-            return
-
-        latest_video = find_latest_video()
-        if not latest_video:
-            yield generated_videos, None, f"⚠️ Không tìm thấy video {label}!"
-            return
-        generated_videos.append(latest_video)
-
-        # --- Trích khung hình cuối làm ảnh đầu cảnh tiếp ---
-        if i < total_scenes - 1:
-            next_img = os.path.join(INPUT_DIR, f"a2v_extracted_{i}_{int(time.time())}.png")
-            extract_frame_at_percent(latest_video, next_img, frame_percent)
-            current_img_path = next_img
-            yield generated_videos, None, f"🔔 [DING] ✅ Xong {label}. Chuẩn bị cảnh tiếp theo..."
-        else:
-            yield generated_videos, None, f"🔔 [DING] ✅ Xong {label}."
-
-    # --- Ghép video + thay audio gốc để đồng bộ hoàn hảo ---
-    if len(generated_videos) > 1:
-        yield generated_videos, None, "🔄 Đang ghép video và đồng bộ audio gốc..."
-        try:
-            concat_out = concat_videos(generated_videos, "a2v_concat_raw")
-        except Exception as e:
-            yield generated_videos, None, f"⚠️ Ghép video thất bại: {e}"
-            return
-
-        # Thay toàn bộ audio track bằng audio gốc → đồng bộ hoàn hảo
-        final_output = os.path.join(OUTPUT_DIR, f"final_a2v_{int(time.time())}.mp4")
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", concat_out,
-            "-i", audio_path,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-shortest",          # cắt theo track ngắn hơn
-            "-c:v", "copy", "-c:a", "aac",
-            final_output,
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode == 0 and os.path.exists(final_output):
-            yield generated_videos, final_output, (
-                f"🔔 [DING] 🎉 Hoàn thành! Video {total_scenes} cảnh đã đồng bộ "
-                f"với audio gốc. Base Seed: {base_seed}")
-        else:
-            # Fallback: trả về video ghép không thay audio
-            yield generated_videos, concat_out, (
-                "🔔 [DING] ✅ Ghép xong (không thay được audio gốc — "
-                "kiểm tra ffmpeg). Video dùng audio từ từng cảnh lẻ.")
-    else:
-        yield generated_videos, generated_videos[0], (
-            f"🔔 [DING] 🎉 Hoàn thành! (Seed: {base_seed})")
-
-
 def submit_and_wait(workflow, scene_label="", max_wait_seconds=1800, poll_interval=2):
     data = json.dumps({"prompt": workflow}).encode("utf-8")
     req = urllib.request.Request("http://127.0.0.1:8188/prompt", data=data)
@@ -1389,11 +768,9 @@ def generate_long_video_gradio(img_path, pos_prompt, aspect_ratio, v_length, v_f
                                 lora1_name, lora1_strength, lora2_name, lora2_strength,
                                 voice_ref_audio, auto_voice_lock):
     if not img_path:
-        yield None, "⚠️ Dạ anh vui lòng tải ảnh lên trước giúp em nha!"
-        return
+        yield None, "⚠️ Dạ anh vui lòng tải ảnh lên trước giúp em nha!"; return
     if not pos_prompt or not pos_prompt.strip():
-        yield None, "⚠️ Dạ anh nhập giúp em câu lệnh (prompt) nha!"
-        return
+        yield None, "⚠️ Dạ anh nhập giúp em câu lệnh (prompt) nha!"; return
 
     num_segments = int(num_segments)
     frame_percent = int(frame_percent)
@@ -1404,8 +781,7 @@ def generate_long_video_gradio(img_path, pos_prompt, aspect_ratio, v_length, v_f
     try:
         ensure_server(low_vram)
     except Exception as e:
-        yield None, f"❌ {e}"
-        return
+        yield None, f"❌ {e}"; return
 
     base_seed = get_seed(v_seed)
     yield None, f"✅ Server sẵn sàng. Bắt đầu tạo {num_segments} phân đoạn... (Base Seed: {base_seed})"
@@ -1433,12 +809,10 @@ def generate_long_video_gradio(img_path, pos_prompt, aspect_ratio, v_length, v_f
         try:
             submit_and_wait(wf, scene_label=label)
         except Exception as e:
-            yield None, f"❌ {e}"
-            return
+            yield None, f"❌ {e}"; return
         latest_video = find_latest_video()
         if not latest_video:
-            yield None, f"⚠️ Không tìm thấy file video đầu ra ở {label}!"
-            return
+            yield None, f"⚠️ Không tìm thấy file video đầu ra ở {label}!"; return
         generated_videos.append(latest_video)
         if voice_ref_name is None and auto_voice_lock and i == 0:
             auto_ref_path = os.path.join(INPUT_DIR, f"voice_ref_auto_{int(time.time())}.wav")
@@ -1455,8 +829,7 @@ def generate_long_video_gradio(img_path, pos_prompt, aspect_ratio, v_length, v_f
         try:
             final_output = concat_videos(generated_videos, "final_long_video")
         except Exception as e:
-            yield generated_videos[-1], f"⚠️ {e}"
-            return
+            yield generated_videos[-1], f"⚠️ {e}"; return
         total_seconds = num_segments * v_length
         yield final_output, f"🔔 [DING] 🎉 Hoàn tất toàn bộ video ({total_seconds}s)! Base Seed: {base_seed}"
     else:
@@ -1473,12 +846,10 @@ def generate_sequence_i2v_gradio(img_path, prompts_text, aspect_ratio, v_length,
                                   ic_lora_name, ic_lora_strength, ic_guide_strength,
                                   voice_ref_audio, auto_voice_lock):
     if not img_path:
-        yield None, None, "⚠️ Dạ anh vui lòng tải ảnh lên trước giúp em nha!"
-        return
+        yield None, None, "⚠️ Dạ anh vui lòng tải ảnh lên trước giúp em nha!"; return
     prompts = split_prompts(prompts_text)
     if not prompts:
-        yield None, None, "⚠️ Dạ anh nhập giúp em ít nhất 1 dòng kịch bản (prompt) nha!"
-        return
+        yield None, None, "⚠️ Dạ anh nhập giúp em ít nhất 1 dòng kịch bản (prompt) nha!"; return
     if char_mode != CHAR_MODE_SMOOTH and not char_ref_path:
         yield None, None, ("⚠️ Bạn đã chọn chế độ bám nhân vật nhưng chưa tải 'Ảnh tham khảo nhân vật' — "
                             "em sẽ tự chuyển về chế độ 'Nối cảnh mượt' cho lần chạy này nha!")
@@ -1493,8 +864,7 @@ def generate_sequence_i2v_gradio(img_path, prompts_text, aspect_ratio, v_length,
     try:
         ensure_server(low_vram)
     except Exception as e:
-        yield None, None, f"❌ {e}"
-        return
+        yield None, None, f"❌ {e}"; return
 
     base_seed = get_seed(v_seed)
     yield None, None, f"✅ Server đã sẵn sàng. Bắt đầu quay... (Base Seed: {base_seed})"
@@ -1539,12 +909,10 @@ def generate_sequence_i2v_gradio(img_path, prompts_text, aspect_ratio, v_length,
         try:
             submit_and_wait(wf, scene_label=label)
         except Exception as e:
-            yield generated_videos, None, f"❌ {e}"
-            return
+            yield generated_videos, None, f"❌ {e}"; return
         latest_video = find_latest_video()
         if not latest_video:
-            yield generated_videos, None, f"⚠️ Không tìm thấy file video {i + 1}!"
-            return
+            yield generated_videos, None, f"⚠️ Không tìm thấy file video {i + 1}!"; return
         generated_videos.append(latest_video)
         if voice_ref_name is None and auto_voice_lock and i == 0:
             auto_ref_path = os.path.join(INPUT_DIR, f"voice_ref_auto_{int(time.time())}.wav")
@@ -1566,8 +934,7 @@ def generate_sequence_i2v_gradio(img_path, prompts_text, aspect_ratio, v_length,
         try:
             final_output = concat_videos(generated_videos, "final_seq_video")
         except Exception as e:
-            yield generated_videos, None, f"⚠️ {e}"
-            return
+            yield generated_videos, None, f"⚠️ {e}"; return
         yield generated_videos, final_output, f"🔔 [DING] 🎉 Đã gộp xong phim! Base Seed: {base_seed}"
     else:
         yield generated_videos, generated_videos[0], f"🔔 [DING] 🎉 Render Complete! (Seed: {base_seed})"
@@ -1615,14 +982,29 @@ def generate_storyboard_flf_gradio(*args):
     n = MAX_FLF_SB_SCENES
     first_img_inputs = args[:n]
     last_img_inputs = args[n:2 * n]
-    (
-        prompts_text, aspect_ratio, v_length, v_fps, v_seed,
-        low_vram, frame_percent, first_strength, last_strength, image_strength,
-        lora1_name, lora1_strength, lora2_name, lora2_strength,
-        char_ref_path, char_mode, periodic_n,
-        ic_lora_name, ic_lora_strength, ic_guide_strength,
-        voice_ref_audio, auto_voice_lock,
-    ) = args[2 * n:]
+    idx = 2 * n
+    prompts_text = args[idx]; idx += 1
+    aspect_ratio = args[idx]; idx += 1
+    v_length = args[idx]; idx += 1
+    v_fps = args[idx]; idx += 1
+    v_seed = args[idx]; idx += 1
+    low_vram = args[idx]; idx += 1
+    frame_percent = args[idx]; idx += 1
+    first_strength = args[idx]; idx += 1
+    last_strength = args[idx]; idx += 1
+    image_strength = args[idx]; idx += 1
+    lora1_name = args[idx]; idx += 1
+    lora1_strength = args[idx]; idx += 1
+    lora2_name = args[idx]; idx += 1
+    lora2_strength = args[idx]; idx += 1
+    char_ref_path = args[idx]; idx += 1
+    char_mode = args[idx]; idx += 1
+    periodic_n = args[idx]; idx += 1
+    ic_lora_name = args[idx]; idx += 1
+    ic_lora_strength = args[idx]; idx += 1
+    ic_guide_strength = args[idx]; idx += 1
+    voice_ref_audio = args[idx]; idx += 1
+    auto_voice_lock = args[idx]; idx += 1
 
     frame_percent = int(frame_percent)
     v_length = int(v_length)
@@ -1631,8 +1013,7 @@ def generate_storyboard_flf_gradio(*args):
     prompts = split_prompts(prompts_text)
 
     if not prompts:
-        yield None, None, "⚠️ Dạ anh nhập giúp em ít nhất 1 dòng kịch bản (prompt) nha!"
-        return
+        yield None, None, "⚠️ Dạ anh nhập giúp em ít nhất 1 dòng kịch bản (prompt) nha!"; return
     if char_mode != CHAR_MODE_SMOOTH and not char_ref_path:
         yield None, None, ("⚠️ Bạn đã chọn chế độ bám nhân vật nhưng chưa tải 'Ảnh tham khảo nhân vật' — "
                             "em sẽ tự chuyển về chế độ 'Nối cảnh mượt' cho lần chạy này nha!")
@@ -1643,8 +1024,7 @@ def generate_storyboard_flf_gradio(*args):
     try:
         ensure_server(low_vram)
     except Exception as e:
-        yield None, None, f"❌ {e}"
-        return
+        yield None, None, f"❌ {e}"; return
 
     base_seed = get_seed(v_seed)
     yield None, None, f"✅ Server đã sẵn sàng. Bắt đầu quay... (Base Seed: {base_seed})"
@@ -1710,13 +1090,11 @@ def generate_storyboard_flf_gradio(*args):
         try:
             submit_and_wait(wf, scene_label=label)
         except Exception as e:
-            yield generated_videos, None, f"❌ {e}"
-            return
+            yield generated_videos, None, f"❌ {e}"; return
 
         scene_video = find_latest_video()
         if not scene_video:
-            yield generated_videos, None, f"⚠️ Không tìm thấy file video {i + 1}!"
-            return
+            yield generated_videos, None, f"⚠️ Không tìm thấy file video {i + 1}!"; return
 
         latest_video = scene_video
         generated_videos.append(scene_video)
@@ -1731,8 +1109,7 @@ def generate_storyboard_flf_gradio(*args):
         try:
             final_output = concat_videos(generated_videos, "final_storyboard_flf_video")
         except Exception as e:
-            yield generated_videos, None, f"⚠️ {e}"
-            return
+            yield generated_videos, None, f"⚠️ {e}"; return
         yield generated_videos, final_output, f"🔔 [DING] 🎉 Đã gộp xong phim! Base Seed: {base_seed}"
     elif len(generated_videos) == 1:
         yield generated_videos, generated_videos[0], f"🔔 [DING] 🎉 Render Complete! (Seed: {base_seed})"
@@ -1935,7 +1312,7 @@ with gr.Blocks(
                                                         step=0.05, value=0.7,
                                                         info="Tăng gần 1.0 để giữ nhân vật/bối cảnh sát ảnh gốc hơn xuyên suốt 10s")
 
-                        lora1_i2v, lora1_str_i2v, lora2_i2v, lora2_str_i2v = _lora_controls_block(_DEFAULT_DISTILLED_LORA or NO_LORA_LABEL)
+                        lora1_i2v, lora1_str_i2v, lora2_i2v, lora2_str_i2v = _lora_controls_block(NO_LORA_LABEL)
 
                         gr.Markdown("**🎤 Khoá giọng nói (thử nghiệm)**",
                                     elem_id="voice-lock-i2v")
@@ -2028,7 +1405,7 @@ with gr.Blocks(
                                                         step=0.05, value=0.7,
                                                         info="Tăng gần 1.0 để mỗi cảnh bám sát ảnh gốc/ảnh tham khảo hơn")
 
-                        lora1_seq, lora1_str_seq, lora2_seq, lora2_str_seq = _lora_controls_block(_DEFAULT_DISTILLED_LORA or NO_LORA_LABEL)
+                        lora1_seq, lora1_str_seq, lora2_seq, lora2_str_seq = _lora_controls_block(NO_LORA_LABEL)
 
                         vram_seq = gr.Checkbox(label="🧊 Low VRAM Mode", value=True)
 
@@ -2142,7 +1519,7 @@ with gr.Blocks(
                                                           step=0.05, value=0.7,
                                                           info="Áp dụng cho các cảnh chỉ có Ảnh Đầu (chế độ I2V)")
 
-                        lora1_flfsb, lora1_str_flfsb, lora2_flfsb, lora2_str_flfsb = _lora_controls_block(_DEFAULT_DISTILLED_LORA or NO_LORA_LABEL)
+                        lora1_flfsb, lora1_str_flfsb, lora2_flfsb, lora2_str_flfsb = _lora_controls_block(NO_LORA_LABEL)
 
                         vram_flfsb = gr.Checkbox(label="🧊 Low VRAM Mode", value=False)
 
@@ -2180,111 +1557,6 @@ with gr.Blocks(
                 fn=clear_all_flfsb,
                 outputs=[*images_flfsb_first, *images_flfsb_last, gallery_flfsb, video_out_flfsb, status_flfsb,
                          prompt_flfsb, scene_count_display_flfsb],
-            )
-
-        # ======================================================================
-        # TAB 4 — A2V Storyboard: Video đồng bộ Audio xuyên suốt
-        # ======================================================================
-        with gr.Tab("🎵 Tab 4 – A2V Storyboard"):
-            gr.HTML("""
-            <div class="info-callout">
-              <p>🎵 <strong>Audio-to-Video Storyboard</strong> — Upload 1 file audio dài (giọng đọc / nhạc / lồng tiếng).
-              Mỗi cảnh sẽ nhận đúng đoạn audio tương ứng làm tín hiệu điều khiển model.
-              Video ghép cuối cùng sẽ được thay audio track bằng audio gốc → đồng bộ giọng nói hoàn hảo xuyên suốt storyboard.<br>
-              <strong>Chế độ:</strong> T2V+Audio (không ảnh) hoặc I2V+Audio (có ảnh đầu). Từ cảnh 2 trở đi tự dùng khung hình cuối cảnh trước.</p>
-            </div>
-            """)
-            with gr.Row():
-                with gr.Column(scale=4):
-                    with gr.Group(elem_classes="settings-card"):
-                        # --- Audio & ảnh đầu ---
-                        gr.Markdown("#### 🎵 Audio & Ảnh Đầu")
-                        audio_a2v = gr.Audio(
-                            label="🎙️ File Audio (wav/mp3/flac) — giọng đọc / nhạc nền",
-                            type="filepath", sources=["upload"],
-                        )
-                        img_a2v = gr.Image(
-                            label="🖼️ Ảnh đầu (tuỳ chọn) — có ảnh → I2V+Audio; bỏ trống → T2V+Audio",
-                            type="filepath", sources=["upload", "clipboard"],
-                        )
-                        image_strength_a2v = gr.Slider(
-                            label="Độ bám ảnh đầu (image strength)",
-                            minimum=0.1, maximum=1.0, step=0.05, value=0.7,
-                            info="Chỉ có tác dụng khi có ảnh đầu",
-                        )
-
-                        gr.Markdown("#### 📝 Kịch bản (mỗi cảnh 1 đoạn, cách nhau bởi dòng trống)")
-                        prompt_a2v = gr.Textbox(
-                            label="Prompts",
-                            placeholder=(
-                                "A news anchor speaking clearly to camera, professional studio background, warm lighting\n\n"
-                                "Close-up of the anchor gesturing, charts appearing on screen behind\n\n"
-                                "Wide shot of the studio, anchor wrapping up the segment"
-                            ),
-                            lines=8,
-                        )
-                        scene_count_a2v = gr.Markdown("🔹 **Số phân cảnh:** 0")
-
-                        # --- Thông số ---
-                        gr.Markdown("#### ⚙️ Thông số Render")
-                        with gr.Row():
-                            ratio_a2v  = gr.Dropdown(label="Tỉ lệ khung hình", choices=ASPECT_RATIO_CHOICES,
-                                                      value="16:9 (832x480) · Mặc định")
-                            length_a2v = gr.Slider(label="Thời lượng mỗi cảnh (giây)",
-                                                    minimum=1, maximum=10, step=1, value=5)
-                        with gr.Row():
-                            fps_a2v    = gr.Slider(label="FPS", minimum=8, maximum=32, step=8, value=24)
-                            seed_a2v   = gr.Textbox(label="Seed (-1 = ngẫu nhiên)", value="-1")
-                        with gr.Row():
-                            frame_pct_a2v = gr.Slider(label="Khung hình trích (%) để nối cảnh",
-                                                       minimum=50, maximum=100, step=5, value=95)
-                            vram_a2v      = gr.Checkbox(label="🧊 Low VRAM Mode", value=False)
-
-                        # --- LoRA ---
-                        lora1_a2v, lora1_str_a2v, lora2_a2v, lora2_str_a2v = \
-                            _lora_controls_block(_DEFAULT_DISTILLED_LORA or NO_LORA_LABEL)
-
-                        # --- IC-LoRA ---
-                        gr.Markdown("**🧬 IC-LoRA Ingredients (tuỳ chọn — cần ảnh tham khảo nhân vật)**")
-                        char_ref_a2v = gr.Image(
-                            label="Ảnh tham khảo nhân vật (IC-LoRA)",
-                            type="filepath", sources=["upload", "clipboard"],
-                        )
-                        with gr.Row():
-                            ic_lora_a2v     = gr.Dropdown(label="File IC-LoRA",
-                                                           choices=list_available_loras(),
-                                                           value=default_ic_lora_choice(), scale=3)
-                            ic_lora_str_a2v = gr.Slider(label="Cường độ", minimum=0.0, maximum=2.0,
-                                                         step=0.05, value=1.0, scale=2)
-                        ic_guide_a2v = gr.Slider(label="Guide strength", minimum=0.0, maximum=1.0,
-                                                  step=0.05, value=1.0)
-
-                with gr.Column(scale=5):
-                    with gr.Group(elem_classes="output-card"):
-                        gallery_a2v    = gr.Gallery(label="🎥 Các Cảnh Lẻ", columns=2, height="auto")
-                        video_out_a2v  = gr.Video(label="🎬 Video Hoàn Chỉnh (đã đồng bộ audio gốc)")
-                        with gr.Row():
-                            btn_a2v   = gr.Button("🎵 Tạo A2V Storyboard", variant="primary")
-                            clear_a2v = gr.Button("🗑️ Clear")
-                        status_a2v = gr.Textbox(label="ℹ️ Status", interactive=False, lines=3,
-                                                 elem_classes="status-box")
-
-            prompt_a2v.change(
-                fn=lambda t: f"🔹 **Số phân cảnh:** {len(split_prompts(t))}",
-                inputs=[prompt_a2v],
-                outputs=[scene_count_a2v],
-            )
-            btn_a2v.click(
-                fn=generate_a2v_storyboard_gradio,
-                inputs=[audio_a2v, img_a2v, prompt_a2v, ratio_a2v, length_a2v, fps_a2v,
-                        seed_a2v, vram_a2v, frame_pct_a2v, image_strength_a2v,
-                        lora1_a2v, lora1_str_a2v, lora2_a2v, lora2_str_a2v,
-                        char_ref_a2v, ic_lora_a2v, ic_lora_str_a2v, ic_guide_a2v],
-                outputs=[gallery_a2v, video_out_a2v, status_a2v],
-            )
-            clear_a2v.click(
-                fn=lambda: (None, None, None, "", "🔹 **Số phân cảnh:** 0"),
-                outputs=[gallery_a2v, video_out_a2v, audio_a2v, status_a2v, scene_count_a2v],
             )
 
 # Khởi chạy Gradio
