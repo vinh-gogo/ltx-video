@@ -122,6 +122,8 @@ sh("apt-get -y install -qq aria2 > /dev/null 2>&1")
 # int8-convrot) phòng khi bạn muốn thử GGUF quant cộng đồng sau này.
 # LoraLoaderModelOnly (dùng để nạp LoRA giữ nhân vật ở Cell 2) là node LÕI có
 # sẵn trong ComfyUI, KHÔNG cần custom node riêng.
+# ComfyUI-LTX2.5-MSR + ComfyUI-PromptRelay: cần cho Cell MSR (ltx2_5_msr.py)
+# — MSR Multi-Subject Reference, cho phép dùng tới 4 ảnh tham khảo nhân vật.
 log("[2/4] Cloning/updating custom nodes...")
 get_ipython().run_line_magic("cd", "-q /content/ComfyUI/custom_nodes")
 
