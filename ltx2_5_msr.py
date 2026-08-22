@@ -387,7 +387,7 @@ def build_msr_workflow(
     # ---- Stage 2: Latent x2 Upscale + Refinement (full resolution) ----
     wf.update({
         "S2_upscale_loader": {"class_type": "LatentUpscaleModelLoader", "inputs": {"model_name": SPATIAL_UPSCALER_FILENAME}},
-        "S2_upsampler":      {"class_type": "LTXVLatentUpsampler",       "inputs": {"samples": ["S1_sep_av", 0], "upscale_model": ["S2_upscale_loader", 0], "vae": ["S1_vvae", 0]}},
+        "S2_upsampler":      {"class_type": "LTXVLatentUpsampler",       "inputs": {"samples": ["S1_crop_guides", 2], "upscale_model": ["S2_upscale_loader", 0], "vae": ["S1_vvae", 0]}},
         "S2_relay": {
             "class_type": "PromptRelayEncode",
             "inputs": {
@@ -400,11 +400,10 @@ def build_msr_workflow(
                 "epsilon":         0.001,
             },
         },
-        "S2_ltxv_cond": {"class_type": "LTXVConditioning", "inputs": {"positive": ["S2_relay", 1], "negative": ["S1_neg_enc", 0], "frame_rate": ["S1_fps", 0]}},
     })
 
     msr_s2 = {
-        "positive": ["S2_ltxv_cond", 0], "negative": ["S2_ltxv_cond", 1],
+        "positive": ["S2_relay", 1], "negative": ["S1_neg_enc", 0],
         "vae": ["S1_vvae", 0], "latent": ["S2_upsampler", 0],
         "msr_parameters": ["S1_msr_loader", 1],
         "strength": float(msr_strength), "reference_frames": reference_frames,
@@ -416,14 +415,15 @@ def build_msr_workflow(
     wf["S2_msr_guide"] = {"class_type": "ComfyUILTX25MSRMultiReferenceGuide", "inputs": msr_s2}
 
     wf.update({
+        "S2_ltxv_cond":   {"class_type": "LTXVConditioning",      "inputs": {"positive": ["S2_msr_guide", 0], "negative": ["S2_msr_guide", 1], "frame_rate": ["S1_fps", 0]}},
         "S2_concat_av":   {"class_type": "LTXVConcatAVLatent",   "inputs": {"video_latent": ["S2_msr_guide", 2], "audio_latent": ["S1_sep_av", 1]}},
-        "S2_dual_guider": {"class_type": "LTXVDualCFGGuider",    "inputs": {"model": ["S2_relay", 0], "positive": ["S2_msr_guide", 0], "negative": ["S2_msr_guide", 1], "video_cfg": 1.0, "audio_cfg": 1.0}},
+        "S2_dual_guider": {"class_type": "LTXVDualCFGGuider",    "inputs": {"model": ["S2_relay", 0], "positive": ["S2_ltxv_cond", 0], "negative": ["S2_ltxv_cond", 1], "video_cfg": 1.0, "audio_cfg": 1.0}},
         "S2_noise":       {"class_type": "RandomNoise",           "inputs": {"noise_seed": PASS2_FIXED_NOISE_SEED}},
         "S2_sampler_sel": {"class_type": "KSamplerSelect",        "inputs": {"sampler_name": "euler_ancestral"}},
         "S2_sigmas":      {"class_type": "ManualSigmas",          "inputs": {"sigmas": SIGMAS_PASS2}},
         "S2_sample":      {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["S2_noise", 0], "guider": ["S2_dual_guider", 0], "sampler": ["S2_sampler_sel", 0], "sigmas": ["S2_sigmas", 0], "latent_image": ["S2_concat_av", 0]}},
         "S2_sep_av":      {"class_type": "LTXVSeparateAVLatent",  "inputs": {"av_latent": ["S2_sample", 0]}},
-        "S2_crop_guides": {"class_type": "LTXVCropGuides",        "inputs": {"positive": ["S2_msr_guide", 0], "negative": ["S2_msr_guide", 1], "latent": ["S2_sep_av", 0]}},
+        "S2_crop_guides": {"class_type": "LTXVCropGuides",        "inputs": {"positive": ["S2_ltxv_cond", 0], "negative": ["S2_ltxv_cond", 1], "latent": ["S2_sep_av", 0]}},
         "S2_vae_tiled":   {"class_type": "VAEDecodeTiled",        "inputs": {"samples": ["S2_crop_guides", 2], "vae": ["S1_vvae", 0], "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 16}},
         "S2_aud_decode":  {"class_type": "LTXVAudioVAEDecode",   "inputs": {"samples": ["S2_sep_av", 1], "audio_vae": ["S1_avae", 0]}},
         "S2_create_vid":  {"class_type": "CreateVideo",           "inputs": {"images": ["S2_vae_tiled", 0], "audio": ["S2_aud_decode", 0], "fps": float(safe_fps)}},
