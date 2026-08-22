@@ -9,18 +9,21 @@
 #
 # MSR LoRA dat tai: /content/ComfyUI/models/loras/ltx2.5/
 
-get_ipython().system("pip install -q gradio")
+get_ipython().system("pip install -q gradio opencv-python")
 
+import glob
 import json
 import math
 import os
 import random
+import re
 import shutil
 import socket
 import subprocess
 import time
 import urllib.request
 
+import cv2
 import gradio as gr
 
 # ==========================================================================
@@ -161,7 +164,6 @@ def list_msr_loras():
 
 
 def find_latest_video(output_dir=OUTPUT_DIR):
-    import glob
     mp4_files = (
         glob.glob(f"{output_dir}*.mp4")
         + glob.glob(f"{output_dir}output/*.mp4")
@@ -170,6 +172,60 @@ def find_latest_video(output_dir=OUTPUT_DIR):
     if not mp4_files:
         return None
     return max(mp4_files, key=os.path.getmtime)
+
+
+def split_prompts(text):
+    if not text or not text.strip():
+        return []
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    blocks = re.split(r"\n[ \t]*\n+", normalized.strip())
+    return [b.strip() for b in blocks if b.strip()]
+
+
+def count_scenes(text):
+    n = len(split_prompts(text))
+    return f"🔹 **Số phân cảnh nhận diện được:** {n}"
+
+
+def has_audio_stream(video_path):
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "a",
+           "-show_entries", "stream=index", "-of", "csv=p=0", video_path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return bool(result.stdout.strip())
+    except Exception:
+        return True
+
+
+def ensure_audio_track(video_path):
+    if has_audio_stream(video_path):
+        return video_path
+    fixed_path = video_path.rsplit(".", 1)[0] + "_silentaudio.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-shortest", "-c:v", "copy", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0",
+        fixed_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0 and os.path.exists(fixed_path):
+        return fixed_path
+    return video_path
+
+
+def concat_videos(video_list, out_name, output_dir=OUTPUT_DIR):
+    safe_video_list = [ensure_audio_track(v) for v in video_list]
+    concat_file_path = os.path.join(output_dir, f"concat_{out_name}.txt")
+    with open(concat_file_path, "w") as f:
+        for vid in safe_video_list:
+            f.write(f"file '{os.path.abspath(vid)}'\n")
+    final_output = os.path.join(output_dir, f"{out_name}_{int(time.time())}.mp4")
+    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file_path,
+           "-c:v", "libx264", "-c:a", "aac", "-pix_fmt", "yuv420p", final_output]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not os.path.exists(final_output):
+        raise RuntimeError("Ghép nối video bằng ffmpeg thất bại. Các file phân đoạn lẻ vẫn còn trong thư mục output.")
+    return final_output
 
 
 def submit_and_wait(workflow, scene_label="", max_wait_seconds=1800, poll_interval=2):
@@ -284,8 +340,15 @@ def build_msr_workflow(
         "S1_empty_aud":   {"class_type": "LTXVEmptyLatentAudio",  "inputs": {"audio_vae": ["S1_avae", 0], "frames_number": ["S1_frames_expr", 1], "frame_rate": ["S1_fps", 0], "batch_size": 1}},
         "S1_relay": {
             "class_type": "PromptRelayEncode",
-            "inputs": {"model": ["S1_msr_loader", 0], "clip": ["S1_clip", 0], "latent": ["S1_empty_vid", 0],
-                       "character_description": prompt_relay_desc, "prompt": prompt_main, "negative_text": "", "relay_strength": 0.001},
+            "inputs": {
+                "model":           ["S1_msr_loader", 0],
+                "clip":            ["S1_clip", 0],
+                "latent":          ["S1_empty_vid", 0],
+                "global_prompt":   prompt_relay_desc or "",
+                "local_prompts":   prompt_main,
+                "segment_lengths": "",
+                "epsilon":         0.001,
+            },
         },
         "S1_ltxv_cond": {"class_type": "LTXVConditioning", "inputs": {"positive": ["S1_relay", 1], "negative": ["S1_neg_enc", 0], "frame_rate": ["S1_fps", 0]}},
     }
@@ -327,8 +390,15 @@ def build_msr_workflow(
         "S2_upsampler":      {"class_type": "LTXVLatentUpsampler",       "inputs": {"samples": ["S1_sep_av", 0], "upscale_model": ["S2_upscale_loader", 0], "vae": ["S1_vvae", 0]}},
         "S2_relay": {
             "class_type": "PromptRelayEncode",
-            "inputs": {"model": ["S1_msr_loader", 0], "clip": ["S1_clip", 0], "latent": ["S2_upsampler", 0],
-                       "character_description": prompt_relay_desc, "prompt": prompt_main, "negative_text": "", "relay_strength": 0.001},
+            "inputs": {
+                "model":           ["S1_msr_loader", 0],
+                "clip":            ["S1_clip", 0],
+                "latent":          ["S2_upsampler", 0],
+                "global_prompt":   prompt_relay_desc or "",
+                "local_prompts":   prompt_main,
+                "segment_lengths": "",
+                "epsilon":         0.001,
+            },
         },
         "S2_ltxv_cond": {"class_type": "LTXVConditioning", "inputs": {"positive": ["S2_relay", 1], "negative": ["S1_neg_enc", 0], "frame_rate": ["S1_fps", 0]}},
     })
@@ -364,32 +434,33 @@ def build_msr_workflow(
 
 
 # ==========================================================================
-# GENERATE
+# GENERATE — HÀM GRADIO GENERATOR
 # ==========================================================================
 def generate_msr_gradio(
     pic1_path, pic2_path, pic3_path, pic4_path, background_path,
     prompt_relay_desc, prompt_main, negative_text,
-    aspect_ratio, v_length, v_fps, v_seed,
+    aspect_ratio, v_length, v_fps, v_seed, num_segments, fixed_seed,
     msr_lora_name, msr_lora_strength, msr_strength,
     reference_frames, use_tiled_encode,
     run_stage2, low_vram,
 ):
     if not pic1_path:
-        yield None, "[!] Vui long tai anh Pic 1 (bat buoc)."; return
-    if not prompt_main or not prompt_main.strip():
-        yield None, "[!] Vui long nhap Prompt chinh."; return
+        yield None, None, "⚠️ Dạ anh vui lòng tải ít nhất ảnh Pic 1 (bắt buộc) giúp em nha!"; return
+    
+    prompts = split_prompts(prompt_main)
+    if not prompts:
+        yield None, None, "⚠️ Dạ anh nhập giúp em ít nhất 1 dòng kịch bản (prompt) nha!"; return
 
     v_width, v_height       = parse_aspect_ratio(aspect_ratio)
     safe_width, safe_height = safe_dims(v_width, v_height)
 
-    yield None, "[~] Dang kiem tra / khoi dong ComfyUI server..."
+    yield None, None, "🔄 Đang kiểm tra / khởi động ComfyUI server..."
     try:
         ensure_server(low_vram)
     except Exception as e:
-        yield None, f"[X] {e}"; return
+        yield None, None, f"❌ {e}"; return
 
-    seed = get_seed(v_seed)
-    yield None, f"[OK] Server san sang. Seed: {seed}"
+    base_seed = get_seed(v_seed)
     os.makedirs(INPUT_DIR, exist_ok=True)
 
     def _copy_img(path, slot_name):
@@ -406,58 +477,106 @@ def generate_msr_gradio(
     pic4_name = _copy_img(pic4_path,       "pic4")
     bg_name   = _copy_img(background_path, "background")
 
-    loaded     = [s for s in [pic1_name, pic2_name, pic3_name, pic4_name, bg_name] if s]
-    stage_note = "Stage 1+2 (upscale x2)" if run_stage2 else "Stage 1 only"
-    yield None, (
-        f"[~] Dang render [{stage_note}]...\n"
-        f"Anh: {len(loaded)} slot | LoRA: {msr_lora_name}\n"
-        f"Kich thuoc: {safe_width}x{safe_height} | {v_length}s | {snap_fps_safe(v_fps)}fps"
+    loaded = [s for s in [pic1_name, pic2_name, pic3_name, pic4_name, bg_name] if s]
+
+    # Quyết định danh sách phân cảnh chạy
+    if len(prompts) > 1:
+        scene_prompts = prompts
+    else:
+        num_segments = max(1, int(num_segments))
+        scene_prompts = [prompts[0]] * num_segments
+
+    total_scenes = len(scene_prompts)
+    total_seconds = total_scenes * int(v_length)
+    stage_note = "Stage 1 + Stage 2 (upscale x2)" if run_stage2 else "Stage 1 only (preview)"
+
+    yield None, None, (
+        f"✅ Server sẵn sàng. Bắt đầu tạo chuỗi {total_scenes} phân cảnh MSR (tổng {total_seconds}s)...\n"
+        f"📸 Ảnh tham khảo: {len(loaded)} slot · Chế độ: {stage_note} · Base Seed: {base_seed}"
     )
 
-    wf = build_msr_workflow(
-        prompt_relay_desc = prompt_relay_desc or "",
-        prompt_main       = prompt_main,
-        negative_text     = negative_text or NEGATIVE_PROMPT_DEFAULT,
-        width=safe_width, height=safe_height,
-        fps=v_fps, duration=v_length, seed=seed,
-        msr_lora_name=msr_lora_name, msr_lora_strength=msr_lora_strength,
-        pic1_name=pic1_name, pic2_name=pic2_name,
-        pic3_name=pic3_name, pic4_name=pic4_name, background_name=bg_name,
-        msr_strength=msr_strength, reference_frames=str(reference_frames),
-        use_tiled_encode=bool(use_tiled_encode), run_stage2=bool(run_stage2),
-    )
+    generated_videos = []
+    for i, p in enumerate(scene_prompts):
+        label = f"phân cảnh {i + 1}/{total_scenes}"
+        seed_i = base_seed if fixed_seed else (base_seed + i)
 
-    try:
-        submit_and_wait(wf, scene_label="MSR")
-    except Exception as e:
-        yield None, f"[X] {e}"; return
+        yield generated_videos, None, (
+            f"🔄 Đang quay {label} [{stage_note}]... (Seed: {seed_i})\n"
+            f"📝 Nội dung: {p[:120]}..."
+        )
 
-    latest_video = find_latest_video()
-    if not latest_video:
-        yield None, "[!] Khong tim thay file video dau ra!"; return
+        wf = build_msr_workflow(
+            prompt_relay_desc = prompt_relay_desc or "",
+            prompt_main       = p,
+            negative_text     = negative_text or NEGATIVE_PROMPT_DEFAULT,
+            width             = safe_width,
+            height            = safe_height,
+            fps               = v_fps,
+            duration          = v_length,
+            seed              = seed_i,
+            msr_lora_name     = msr_lora_name,
+            msr_lora_strength = msr_lora_strength,
+            pic1_name         = pic1_name,
+            pic2_name         = pic2_name,
+            pic3_name         = pic3_name,
+            pic4_name         = pic4_name,
+            background_name   = bg_name,
+            msr_strength      = msr_strength,
+            reference_frames  = str(reference_frames),
+            use_tiled_encode  = bool(use_tiled_encode),
+            run_stage2        = bool(run_stage2),
+        )
 
-    yield latest_video, f"[DING] Hoan tat! Video da luu. (Seed: {seed})"
+        try:
+            submit_and_wait(wf, scene_label=label)
+        except Exception as e:
+            yield generated_videos, None, f"❌ {e}"; return
+
+        latest_video = find_latest_video()
+        if not latest_video:
+            yield generated_videos, None, f"⚠️ Không tìm thấy file video ở {label}!"; return
+
+        generated_videos.append(latest_video)
+        yield generated_videos, None, f"🔔 [DING] ✅ Xong {label} ({i + 1}/{total_scenes})!"
+
+    # Ghép nối các phân cảnh thành 1 video dài hoàn chỉnh
+    if len(generated_videos) > 1:
+        yield generated_videos, None, "🔄 Đang tiến hành ghép nối các phân cảnh bằng ffmpeg..."
+        try:
+            final_output = concat_videos(generated_videos, "final_long_msr_video")
+        except Exception as e:
+            yield generated_videos, generated_videos[-1], f"⚠️ {e}"; return
+        yield generated_videos, final_output, (
+            f"🔔 [DING] 🎉 Hoàn tất toàn bộ phim MSR ({total_seconds}s, {total_scenes} phân cảnh)! Base Seed: {base_seed}"
+        )
+    elif len(generated_videos) == 1:
+        yield generated_videos, generated_videos[0], (
+            f"🔔 [DING] 🎉 Render Complete! Đã tạo xong video ({v_length}s). (Seed: {base_seed})"
+        )
 
 
 # ==========================================================================
 # GRADIO UI
 # ==========================================================================
 ratio_choices = [
-    "16:9 (1280x720) - HD 720p Ngang",
-    "9:16 (720x1280) - HD 720p Doc",
-    "1:1 (720x720) - HD 720p Vuong",
-    "16:9 (832x480) - Nhe / Tiet kiem VRAM",
-    "9:16 (480x832) - Nhe / Tiet kiem VRAM",
+    "16:9 (1280x720) · HD 720p Ngang",
+    "9:16 (720x1280) · HD 720p Dọc",
+    "1:1 (720x720) · HD 720p Vuông",
+    "16:9 (832x480) · Nhẹ / Tiết kiệm VRAM",
+    "9:16 (480x832) · Nhẹ / Tiết kiệm VRAM",
 ]
 
 custom_css = """
-.gradio-container { max-width: 1440px; margin: 0 auto; }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+.gradio-container { font-family: 'Inter', sans-serif !important; max-width: 1560px; margin: 0 auto; }
 #msr-header { background: linear-gradient(135deg, #7c3aed 0%, #a855f7 100%);
-              border-radius:16px; padding:20px 26px; margin-bottom:14px; }
+              border-radius:16px; padding:20px 26px; margin-bottom:14px; box-shadow: 0 6px 20px rgba(124,58,237,.28); }
 #msr-header h1, #msr-header p { color:#fff !important; margin:0 !important; }
 .info-box { background:rgba(99,102,241,.08); border-left:3px solid #6366f1;
             padding:10px 14px; border-radius:8px; font-size:.87rem;
             margin-bottom:8px; }
+.scene-counter { display: inline-block; background: rgba(99, 102, 241, 0.12); padding: 6px 14px; border-radius: 999px; font-weight: 600 !important; font-size: 0.85rem !important; margin: 2px 0 6px 0 !important; }
+.scene-counter p { margin: 0 !important; color: #4f46e5 !important; }
 .status-box textarea { font-family:monospace !important; font-size:.82rem !important; }
 """
 
@@ -471,7 +590,7 @@ function(){
             o.type='sine'; o.frequency.setValueAtTime(880,c.currentTime);
             o.frequency.exponentialRampToValueAtTime(1760,c.currentTime+.15);
             g.gain.setValueAtTime(.3,c.currentTime);
-            g.exponentialRampToValueAtTime(.01,c.currentTime+.4);
+            g.gain.exponentialRampToValueAtTime(.01,c.currentTime+.4);
             o.connect(g);g.connect(c.destination);o.start();o.stop(c.currentTime+.4);
         }catch(e){}
     }
@@ -496,148 +615,159 @@ with gr.Blocks(
         with gr.Row():
             with gr.Column(scale=4):
                 gr.Markdown(
-                    "# LTX-2.5 MSR Studio\n"
-                    "Multi-Subject Reference - Tao video tu nhieu anh tham khao nhan vat\n\n"
-                    "LTX-2.5 | Toi da 4 nhan vat + 1 nen | 2-Stage: Generation + Latent x2 Upscale"
+                    """
+                    # 🎬 LTX-2.5 MSR Studio (Tạo Video Dài Tự Động)
+                    Multi-Subject Reference — Tạo phim dài nhiều phân cảnh từ ảnh tham khảo nhân vật & bối cảnh
+                    
+                    <div style="margin-top:4px; opacity:0.9; font-size:0.9rem;">
+                    ⚡ LTX-2.5 · 🎭 Tối đa 4 nhân vật + 1 bối cảnh · 🎞️ Tự động render chuỗi kịch bản & ghép nối hoàn chỉnh bằng ffmpeg
+                    </div>
+                    """
                 )
             with gr.Column(scale=1, min_width=160):
-                restart_btn = gr.Button("Restart Server", size="sm")
-                restart_out = gr.Markdown("San sang")
+                restart_btn = gr.Button("🔄 Restart Server", size="sm")
+                restart_out = gr.Markdown("🟢 Sẵn sàng")
         restart_btn.click(fn=force_restart_server, outputs=[restart_out])
 
     with gr.Row():
+        # --- CỘT TRÁI: INPUTS ---
         with gr.Column(scale=5):
 
             with gr.Group():
-                gr.Markdown("### Anh tham khao nhan vat / boi canh")
+                gr.Markdown("### 📸 Ảnh tham khảo nhân vật / bối cảnh")
                 gr.Markdown(
                     "<div class='info-box'>"
-                    "Thu tu slot co dinh: Pic 1 - Pic 2 - Pic 3 - Pic 4 - Background. "
-                    "Chi Pic 1 bat buoc, cac slot con lai tuy chon."
+                    "Thứ tự slot cố định: <b>Pic 1 → Pic 2 → Pic 3 → Pic 4 → Background</b>. "
+                    "Chỉ <b>Pic 1</b> bắt buộc, các slot còn lại tuỳ chọn. "
+                    "Slot ID và learned embeddings được giữ nguyên cho tất cả các phân cảnh."
                     "</div>"
                 )
                 with gr.Row():
-                    msr_pic1 = gr.Image(label="Pic 1 - Nhan vat 1 (bat buoc)", type="filepath")
-                    msr_pic2 = gr.Image(label="Pic 2 - Nhan vat 2 (tuy chon)", type="filepath")
+                    msr_pic1 = gr.Image(label="🎭 Pic 1 - Nhân vật 1 (bắt buộc)", type="filepath")
+                    msr_pic2 = gr.Image(label="🎭 Pic 2 - Nhân vật 2 (tuỳ chọn)", type="filepath")
                 with gr.Row():
-                    msr_pic3 = gr.Image(label="Pic 3 - Nhan vat 3 (tuy chon)", type="filepath")
-                    msr_pic4 = gr.Image(label="Pic 4 - Nhan vat 4 (tuy chon)", type="filepath")
-                msr_bg = gr.Image(label="Background - Boi canh (tuy chon)", type="filepath")
+                    msr_pic3 = gr.Image(label="🎭 Pic 3 - Nhân vật 3 (tuỳ chọn)", type="filepath")
+                    msr_pic4 = gr.Image(label="🎭 Pic 4 - Nhân vật 4 (tuỳ chọn)", type="filepath")
+                msr_bg = gr.Image(label="🌄 Background - Bối cảnh (tuỳ chọn)", type="filepath")
 
             with gr.Group():
-                gr.Markdown("### Prompt")
+                gr.Markdown("### 📝 Kịch bản & Prompt")
                 gr.Markdown(
                     "<div class='info-box'>"
-                    "PromptRelayEncode dung 2 truong rieng biet:<br>"
-                    "(1) Mo ta nhan vat: mo ta tung nhan vat theo thu tu slot (Image 1: ... / Image 2: ...)<br>"
-                    "(2) Prompt chinh: kich ban hanh dong video day du"
+                    "① <b>Mô tả nhân vật</b>: mô tả ngoại hình từng nhân vật (<code>Image 1:... Image 2:...</code>)<br>"
+                    "② <b>Kịch bản phim</b>: có thể nhập nhiều phân cảnh (mỗi cảnh cách nhau 1 dòng trống ~ 2 lần Enter). "
+                    "Hệ thống sẽ tự động quay lần lượt từng cảnh 10s rồi tự ghép nối thành phim dài 30s, 60s!"
                     "</div>"
                 )
                 msr_relay_desc = gr.Textbox(
-                    label="(1) Mo ta nhan vat (character_description)",
-                    lines=5,
+                    label="① Mô tả nhân vật (character_description)",
+                    lines=4,
                     placeholder=(
-                        "Image 1: Beast-girl, fluffy orange cat ears, big amber eyes, "
-                        "cream-white puffy dress, Pixar-style 3D cartoon rendering.\n\n"
-                        "Image 2: Elf girl, long pointed ears, silver-white long hair, "
-                        "leaf-green robe, Pixar-style 3D cartoon rendering.\n\n"
-                        "Image 3: Scene, enchanted forest clearing, warm golden light."
+                        "Image 1: A real chubby orange tabby cat with fluffy ginger fur, wearing a miniature chef hat...\n\n"
+                        "Image 2: A real cute Corgi puppy wearing a red bandana...\n\n"
+                        "Image 3: A real curious raccoon holding a small wooden spoon..."
                     ),
                 )
+                scene_count_display = gr.Markdown("🔹 **Số phân cảnh nhận diện được:** 0", elem_classes="scene-counter")
                 msr_prompt = gr.Textbox(
-                    label="(2) Prompt chinh - hanh dong / kich ban",
+                    label="② Kịch bản / Prompt chính (mỗi phân cảnh cách nhau 1 dòng trống)",
                     lines=6,
                     placeholder=(
-                        "A clearing in an enchanted forest, warm dappled golden light. "
-                        "[Shot 1] Wide two-shot: the beast-girl and elf girl stand in the clearing "
-                        "as camera slow-dolly-pushes in 30%..."
+                        "[Shot 1] The orange cat gestures with a wooden spoon atop the counter...\n\n"
+                        "[Shot 2] The refrigerator door opens, the corgi puppy slips on the floor and slides...\n\n"
+                        "[Shot 3] All animals feast on cake, the light clicks on and they freeze staring at camera..."
                     ),
                 )
                 msr_neg = gr.Textbox(
-                    label="Negative Prompt",
+                    label="🚫 Negative Prompt",
                     lines=2,
                     value=NEGATIVE_PROMPT_DEFAULT,
                 )
 
-            with gr.Accordion("Cai dat nang cao", open=False):
-                gr.Markdown("**Kich thuoc & thoi luong**")
+            with gr.Accordion("⚙️ Cài đặt nâng cao", open=False):
+                gr.Markdown("**📐 Kích thước & thời lượng**")
                 ratio_msr = gr.Radio(
-                    label="Ti le khung hinh",
+                    label="Tỉ lệ khung hình",
                     choices=ratio_choices,
                     value=ratio_choices[0],
-                    info="Stage 1 chay 1/2 res, Stage 2 upscale x2 ve full res",
+                    info="Stage 1 chạy ½ res, Stage 2 upscale x2 về full res",
                 )
                 with gr.Row():
-                    length_msr = gr.Slider(label="Thoi luong (giay)", minimum=1, maximum=10, step=1, value=10)
-                    fps_msr    = gr.Slider(label="FPS", minimum=8, maximum=120, step=8, value=24)
-                seed_msr = gr.Number(label="Seed (-1 = ngau nhien)", value=-1, precision=0)
+                    length_msr = gr.Slider(label="⏱️ Thời lượng MỖI cảnh (giây)", minimum=1, maximum=10, step=1, value=10)
+                    fps_msr    = gr.Slider(label="🎞️ FPS", minimum=8, maximum=120, step=8, value=24)
+                
+                with gr.Row():
+                    seed_msr = gr.Number(label="🎲 Seed (-1 = ngẫu nhiên)", value=-1, precision=0)
+                    num_segments_msr = gr.Slider(
+                        label="🔢 Số phân đoạn (khi chỉ có 1 prompt)",
+                        minimum=1, maximum=10, step=1, value=1,
+                        info="Chỉ áp dụng nếu ô kịch bản chỉ có 1 prompt đơn"
+                    )
+                fixed_seed_msr = gr.Checkbox(label="🔗 Dùng chung 1 Seed cho mọi phân cảnh", value=False)
 
-                gr.Markdown("**MSR LoRA**")
-                gr.Markdown(
-                    "<div class='info-box'>"
-                    "Dat file LoRA vao /content/ComfyUI/models/loras/ltx2.5/ roi nhan Refresh."
-                    "</div>"
-                )
+                gr.Markdown("**🧬 MSR LoRA**")
                 with gr.Row():
                     msr_lora_dd = gr.Dropdown(
                         label="MSR LoRA", choices=list_msr_loras(), value=MSR_LORA_FILENAME, scale=3)
                     msr_lora_str_sl = gr.Slider(
                         label="LoRA strength", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=2)
-                msr_refresh_btn = gr.Button("Refresh MSR LoRA", size="sm")
+                msr_refresh_btn = gr.Button("🔄 Refresh MSR LoRA", size="sm")
                 msr_refresh_btn.click(fn=lambda: gr.update(choices=list_msr_loras()), outputs=[msr_lora_dd])
 
-                gr.Markdown("**Cai dat MSR Guide**")
+                gr.Markdown("**🎯 Cài đặt MSR Guide**")
                 msr_guide_str_sl = gr.Slider(
                     label="Reference strength", minimum=0.0, maximum=2.0, step=0.05, value=1.0,
-                    info="Do bam anh tham khao - 1.0 bam sat nhat")
+                    info="Độ bám ảnh tham khảo — 1.0 bám sát nhất")
                 with gr.Row():
                     msr_ref_frames = gr.Radio(
                         label="Reference frames", choices=["25", "33"], value="33",
-                        info="33 = mac dinh MSR chinh thuc")
+                        info="33 = mặc định MSR chính thức")
                     msr_tiled = gr.Checkbox(label="Tiled VAE encode", value=False)
 
-                gr.Markdown("**Pipeline**")
+                gr.Markdown("**⚙️ Pipeline**")
                 with gr.Row():
-                    msr_stage2   = gr.Checkbox(label="Chay Stage 2 (upscale x2 + refine)", value=True)
-                    msr_low_vram = gr.Checkbox(label="Low VRAM Mode", value=True)
+                    msr_stage2   = gr.Checkbox(label="✅ Chạy Stage 2 (upscale x2 + refine)", value=True)
+                    msr_low_vram = gr.Checkbox(label="🧊 Low VRAM Mode", value=True)
 
+        # --- CỘT PHẢI: OUTPUTS ---
         with gr.Column(scale=5):
             with gr.Group():
-                msr_video_out = gr.Video(label="MSR Output Video", height=420)
+                gallery_msr = gr.Gallery(label="🎥 Các Phân Cảnh Lẻ (Shot 1, Shot 2...)", columns=2, height="auto")
+                video_out_msr = gr.Video(label="🎬 Phim Dài Hoàn Chỉnh (Ghép Nối Liền Mạch)")
                 with gr.Row():
-                    msr_btn   = gr.Button("Tao Video MSR", variant="primary", scale=3)
-                    msr_clear = gr.Button("Clear", scale=1)
+                    msr_btn   = gr.Button("🎬 Bắt Đầu Tạo Phim MSR", variant="primary", scale=3)
+                    msr_clear = gr.Button("🗑️ Clear", scale=1)
                 msr_status = gr.Textbox(
-                    label="Status / Log", interactive=False, lines=5, elem_classes="status-box")
+                    label="ℹ️ Status / Tiến trình", interactive=False, lines=5, elem_classes="status-box")
 
             gr.Markdown(
                 "<div class='info-box'>"
-                "<b>Custom nodes can cai:</b><br>"
-                "- ComfyUI-LTX2.5-MSR : liconstudio/ComfyUI-LTX2.5-MSR<br>"
-                "- ComfyUI-PromptRelay : kijai/ComfyUI-PromptRelay<br>"
-                "- ComfyUI-KJNodes     : kijai/ComfyUI-KJNodes<br><br>"
-                "<b>Models can thiet:</b><br>"
-                "- UNET     -> models/diffusion_models/<br>"
-                "- CLIP     -> models/text_encoders/<br>"
-                "- VAE      -> models/vae/<br>"
-                "- Upscaler -> models/<br>"
-                "- MSR LoRA -> models/loras/ltx2.5/"
+                "<b>💡 Hướng dẫn tạo phim 30s–60s:</b><br>"
+                "• Bạn dán toàn bộ 3 phân đoạn trong kịch bản vào ô prompt (cách nhau 2 lần Enter).<br>"
+                "• Nhấn <b>Bắt Đầu Tạo Phim MSR</b>: hệ thống sẽ tự động chạy Shot 1 (10s) → Shot 2 (10s) → Shot 3 (10s) "
+                "rồi tự ghép lại thành 1 video 30s hoàn chỉnh!<br>"
+                "• Tất cả các cảnh đều đồng bộ giữ nguyên đúng nhân vật từ các ảnh tham khảo."
                 "</div>"
             )
+
+    msr_prompt.change(fn=count_scenes, inputs=[msr_prompt], outputs=[scene_count_display])
 
     msr_btn.click(
         fn=generate_msr_gradio,
         inputs=[
             msr_pic1, msr_pic2, msr_pic3, msr_pic4, msr_bg,
             msr_relay_desc, msr_prompt, msr_neg,
-            ratio_msr, length_msr, fps_msr, seed_msr,
+            ratio_msr, length_msr, fps_msr, seed_msr, num_segments_msr, fixed_seed_msr,
             msr_lora_dd, msr_lora_str_sl, msr_guide_str_sl,
             msr_ref_frames, msr_tiled,
             msr_stage2, msr_low_vram,
         ],
-        outputs=[msr_video_out, msr_status],
+        outputs=[gallery_msr, video_out_msr, msr_status],
     )
-    msr_clear.click(fn=lambda: (None, ""), outputs=[msr_video_out, msr_status])
+    msr_clear.click(
+        fn=lambda: (None, None, "", "🔹 **Số phân cảnh nhận diện được:** 0"),
+        outputs=[gallery_msr, video_out_msr, msr_status, scene_count_display],
+    )
 
 demo.queue()
 demo.launch(share=True, inline=False, debug=True)

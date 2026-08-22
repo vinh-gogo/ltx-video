@@ -82,6 +82,7 @@ AUTH_HEADER = f"Authorization: Bearer {HF_TOKEN}"
 # không LoRA, hoặc muốn tự upload LoRA của riêng bạn (đã train từ nhân vật cụ
 # thể) thẳng vào /content/ComfyUI/models/loras/ sau này.
 DOWNLOAD_CHARACTER_LORA = True
+DOWNLOAD_MSR_LORA = True  # LoRA Multi-Subject Reference (LiconStudio MSR V1) cho Cell MSR (ltx2_5_msr.py)
 
 # --------------------------------------------------------------------------
 # [1/4] Cài thư viện lõi + clone/cập nhật ComfyUI
@@ -133,6 +134,9 @@ CUSTOM_NODES = [
     "https://github.com/Lightricks/ComfyUI-LTXVideo/",
     "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
     "https://github.com/kijai/ComfyUI-MelBandRoFormer",
+    # --- MSR (Multi-Subject Reference — dùng cho Cell MSR ltx2_5_msr.py) ---
+    "https://github.com/liconstudio/ComfyUI-LTX2.5-MSR",
+    "https://github.com/kijai/ComfyUI-PromptRelay",
 ]
 for repo_url in CUSTOM_NODES:
     node_name = repo_url.rstrip("/").split("/")[-1]
@@ -169,6 +173,11 @@ SPATIAL_UPSCALER_FILENAME = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safeten
 # Cường độ khuyến nghị chính chủ: strength = 1.0 (Cell 2 đặt sẵn mặc định này).
 CHARACTER_LORA_REPO = "Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients"
 CHARACTER_LORA_FILENAME = "ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors"
+
+# LoRA MSR (Multi-Subject Reference — dùng cho Cell MSR ltx2_5_msr.py).
+# Repo: LiconStudio/LTX-2.5-Multiple-Subject-Reference (hỗ trợ 1-5 ảnh tham khảo).
+MSR_LORA_REPO = "LiconStudio/LTX-2.5-Multiple-Subject-Reference"
+MSR_LORA_FILENAME = "LTX-2.5-Licon-MSR-V1.safetensors"
 
 
 def dl(url, dest, fname, connections=8, gated=False):
@@ -241,6 +250,14 @@ else:
         "/content/ComfyUI/models/loras/ rồi chọn trong dropdown ở Cell 2.",
         color="#90caf9")
 
+if DOWNLOAD_MSR_LORA:
+    DOWNLOAD_JOBS.append((
+        f"https://huggingface.co/{MSR_LORA_REPO}/resolve/main/{MSR_LORA_FILENAME}",
+        "/content/ComfyUI/models/loras/ltx2.5", MSR_LORA_FILENAME, False,
+    ))
+else:
+    log("ℹ️ DOWNLOAD_MSR_LORA=False -> bỏ qua tải LoRA MSR.", color="#90caf9")
+
 # Tải tối đa 3 file cùng lúc, 8 luồng/file.
 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
     futures = [executor.submit(dl, url, dest, fname, 8, gated) for url, dest, fname, gated in DOWNLOAD_JOBS]
@@ -267,11 +284,18 @@ else:
         if DOWNLOAD_CHARACTER_LORA else
         "<br>ℹ️ Chưa tải LoRA giữ nhân vật (đã tắt DOWNLOAD_CHARACTER_LORA)."
     )
+    msr_note = (
+        "<br>🧬 LoRA MSR (Licon MSR V1) đã sẵn sàng trong <code>models/loras/ltx2.5/</code> "
+        "— dùng cho Cell MSR (<code>ltx2_5_msr.py</code>)."
+        if DOWNLOAD_MSR_LORA else
+        ""
+    )
     display(HTML(
         "<div style='padding:15px;background-color:#e8f5e9;border-left:5px solid #4caf50;"
         "border-radius:4px;color:#2e7d32;font-family:sans-serif;'>"
         "<b>✨ Initialization Complete!</b> Môi trường LTX-2.5 đã sẵn sàng."
         f"{lora_note}"
+        f"{msr_note}"
         "<br><small>⚠️ Nhắc lại: transformer + text encoder chính ~37GB VRAM/weights — "
         "cần GPU 24GB+ (L4/A100). Trên T4 16GB nhiều khả năng sẽ OOM dù bật Low VRAM Mode.</small>"
         "<br><small>⚠️ LoRA Ingredients được train trên LTX-2.3; Lightricks xác nhận đa số "
