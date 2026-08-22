@@ -1691,7 +1691,7 @@
         }
       },
       "widgets_values": [
-        "LTX25_MSR_Distilled8",
+        "output/LTX25_MSR_Distilled8",
         "auto",
         "auto"
       ]
@@ -1803,7 +1803,7 @@
         }
       },
       "widgets_values": [
-        "ltx2.5\\LTX-2.5-Licon-MSR-V1.safetensors",
+        "ltx2.5/LTX-2.5-Licon-MSR-V1.safetensors",
         1
       ]
     },
