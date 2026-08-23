@@ -48,7 +48,11 @@ SIGMAS_PASS1 = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875,
 SIGMAS_PASS2 = "0.85, 0.7250, 0.4219, 0.0"
 
 NEGATIVE_PROMPT_DEFAULT = (
-    "subtitles, watermark, worst quality, blurry, jittery, distorted, inconsistent appearance"
+    "blurry, oversaturated, pixelated, low resolution, grainy, distorted, noise, "
+    "compression artifacts, glitches, watermark, text, logo, subtitles, "
+    "static frame, frozen image, standing still, lack of motion, ignored prompt, "
+    "deformed limbs, extra paws, duplicate limbs, distorted face, inconsistent appearance, "
+    "mid-shot camera cut, character switching, sudden transition"
 )
 
 
@@ -279,28 +283,31 @@ def build_msr_workflow(
     fps=24,
     duration=10,
     seed=None,
+    video_cfg=1.5,
+    audio_cfg=1.0,
     msr_lora_name=None,
-    msr_lora_strength=1.0,
+    msr_lora_strength=0.85,
     pic1_name=None,
     pic2_name=None,
     pic3_name=None,
     pic4_name=None,
     background_name=None,
-    msr_strength=1.0,
+    msr_strength=0.7,
     reference_frames="33",
     use_tiled_encode=False,
     tile_size=256,
     run_stage2=True,
 ):
-    """Build workflow MSR 2-stage theo LTX2.5-MSR-sample-workflow.json.
+    """Build workflow MSR 2-stage theo LTX2.5-MSR-sample-workflow.json kết hợp
+    cơ chế LTXVDualCFGGuider từ ltx2_5.py giúp video tuân thủ cao theo Prompt.
 
     Stage 1: UNETLoader -> ComfyUILTX25MSRICLoRALoader
              PromptRelayEncode -> LTXVConditioning
              ComfyUILTX25MSRMultiReferenceGuide
-             CFGGuider -> SamplerCustomAdvanced -> SaveVideo (1/2 res)
+             LTXVDualCFGGuider (video_cfg / audio_cfg) -> SamplerCustomAdvanced -> SaveVideo (1/2 res)
 
     Stage 2: LTXVLatentUpsampler -> PromptRelayEncode -> LTXVConditioning
-             ComfyUILTX25MSRMultiReferenceGuide -> LTXVDualCFGGuider
+             ComfyUILTX25MSRMultiReferenceGuide -> LTXVDualCFGGuider (video_cfg / audio_cfg)
              SamplerCustomAdvanced -> VAEDecodeTiled -> SaveVideo (full res)
     """
     if negative_text is None:
@@ -369,12 +376,12 @@ def build_msr_workflow(
     wf["S1_msr_guide"] = {"class_type": "ComfyUILTX25MSRMultiReferenceGuide", "inputs": msr_s1}
 
     wf.update({
-        "S1_cfg_guider":  {"class_type": "CFGGuider",           "inputs": {"model": ["S1_relay", 0], "positive": ["S1_msr_guide", 0], "negative": ["S1_msr_guide", 1], "cfg": 1.0}},
+        "S1_dual_guider": {"class_type": "LTXVDualCFGGuider",    "inputs": {"model": ["S1_relay", 0], "positive": ["S1_msr_guide", 0], "negative": ["S1_msr_guide", 1], "video_cfg": float(video_cfg), "audio_cfg": float(audio_cfg)}},
         "S1_noise":       {"class_type": "RandomNoise",          "inputs": {"noise_seed": int(seed)}},
         "S1_sampler_sel": {"class_type": "KSamplerSelect",       "inputs": {"sampler_name": "euler_ancestral"}},
         "S1_sigmas":      {"class_type": "ManualSigmas",         "inputs": {"sigmas": SIGMAS_PASS1}},
         "S1_concat_av":   {"class_type": "LTXVConcatAVLatent",   "inputs": {"video_latent": ["S1_msr_guide", 2], "audio_latent": ["S1_empty_aud", 0]}},
-        "S1_sample":      {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["S1_noise", 0], "guider": ["S1_cfg_guider", 0], "sampler": ["S1_sampler_sel", 0], "sigmas": ["S1_sigmas", 0], "latent_image": ["S1_concat_av", 0]}},
+        "S1_sample":      {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["S1_noise", 0], "guider": ["S1_dual_guider", 0], "sampler": ["S1_sampler_sel", 0], "sigmas": ["S1_sigmas", 0], "latent_image": ["S1_concat_av", 0]}},
         "S1_sep_av":      {"class_type": "LTXVSeparateAVLatent",  "inputs": {"av_latent": ["S1_sample", 0]}},
         "S1_crop_guides": {"class_type": "LTXVCropGuides",       "inputs": {"positive": ["S1_msr_guide", 0], "negative": ["S1_msr_guide", 1], "latent": ["S1_sep_av", 0]}},
         "S1_vae_decode":  {"class_type": "VAEDecode",             "inputs": {"samples": ["S1_crop_guides", 2], "vae": ["S1_vvae", 0]}},
@@ -404,11 +411,14 @@ def build_msr_workflow(
         },
     })
 
+    stage2_seed = (int(seed) + 1000) if seed is not None else 42
+    stage2_msr_strength = min(0.6, safe_msr_strength * 0.8)
+
     msr_s2 = {
         "positive": ["S2_relay", 1], "negative": ["S1_neg_enc", 0],
         "vae": ["S1_vvae", 0], "latent": ["S2_upsampler", 0],
         "msr_parameters": ["S1_msr_loader", 1],
-        "strength": safe_msr_strength, "reference_frames": reference_frames,
+        "strength": stage2_msr_strength, "reference_frames": reference_frames,
         "use_tiled_encode": use_tiled_encode, "tile_size": tile_size, "tile_overlap": 0,
     }
     for slot, img in pic_slot_map:
@@ -419,8 +429,8 @@ def build_msr_workflow(
     wf.update({
         "S2_ltxv_cond":   {"class_type": "LTXVConditioning",      "inputs": {"positive": ["S2_msr_guide", 0], "negative": ["S2_msr_guide", 1], "frame_rate": ["S1_fps", 0]}},
         "S2_concat_av":   {"class_type": "LTXVConcatAVLatent",   "inputs": {"video_latent": ["S2_msr_guide", 2], "audio_latent": ["S1_sep_av", 1]}},
-        "S2_dual_guider": {"class_type": "LTXVDualCFGGuider",    "inputs": {"model": ["S2_relay", 0], "positive": ["S2_ltxv_cond", 0], "negative": ["S2_ltxv_cond", 1], "video_cfg": 1.0, "audio_cfg": 1.0}},
-        "S2_noise":       {"class_type": "RandomNoise",           "inputs": {"noise_seed": PASS2_FIXED_NOISE_SEED}},
+        "S2_dual_guider": {"class_type": "LTXVDualCFGGuider",    "inputs": {"model": ["S2_relay", 0], "positive": ["S2_ltxv_cond", 0], "negative": ["S2_ltxv_cond", 1], "video_cfg": float(video_cfg), "audio_cfg": float(audio_cfg)}},
+        "S2_noise":       {"class_type": "RandomNoise",           "inputs": {"noise_seed": stage2_seed}},
         "S2_sampler_sel": {"class_type": "KSamplerSelect",        "inputs": {"sampler_name": "euler_ancestral"}},
         "S2_sigmas":      {"class_type": "ManualSigmas",          "inputs": {"sigmas": SIGMAS_PASS2}},
         "S2_sample":      {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["S2_noise", 0], "guider": ["S2_dual_guider", 0], "sampler": ["S2_sampler_sel", 0], "sigmas": ["S2_sigmas", 0], "latent_image": ["S2_concat_av", 0]}},
@@ -442,7 +452,7 @@ def generate_msr_gradio(
     pic1_path, pic2_path, pic3_path, pic4_path, background_path,
     prompt_relay_desc, prompt_main, negative_text,
     aspect_ratio, v_length, v_fps, v_seed, num_segments, fixed_seed,
-    msr_lora_name, msr_lora_strength, msr_strength,
+    video_cfg, msr_lora_name, msr_lora_strength, msr_strength,
     reference_frames, use_tiled_encode,
     run_stage2, low_vram,
 ):
@@ -494,7 +504,7 @@ def generate_msr_gradio(
 
     yield None, None, (
         f"✅ Server sẵn sàng. Bắt đầu tạo chuỗi {total_scenes} phân cảnh MSR (tổng {total_seconds}s)...\n"
-        f"📸 Ảnh tham khảo: {len(loaded)} slot · Chế độ: {stage_note} · Base Seed: {base_seed}"
+        f"📸 Ảnh tham khảo: {len(loaded)} slot · Chế độ: {stage_note} · Base Seed: {base_seed} · Video CFG: {video_cfg}"
     )
 
     generated_videos = []
@@ -516,6 +526,7 @@ def generate_msr_gradio(
             fps               = v_fps,
             duration          = v_length,
             seed              = seed_i,
+            video_cfg         = float(video_cfg or 1.5),
             msr_lora_name     = msr_lora_name,
             msr_lora_strength = msr_lora_strength,
             pic1_name         = pic1_name,
@@ -712,14 +723,19 @@ with gr.Blocks(
                     msr_lora_dd = gr.Dropdown(
                         label="MSR LoRA", choices=list_msr_loras(), value=MSR_LORA_FILENAME, scale=3)
                     msr_lora_str_sl = gr.Slider(
-                        label="LoRA strength", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=2)
+                        label="LoRA strength", minimum=0.0, maximum=2.0, step=0.05, value=0.85, scale=2,
+                        info="0.85 = cân bằng hoàn hảo giữa nhận diện nhân vật & độ tự do chuyển động")
                 msr_refresh_btn = gr.Button("🔄 Refresh MSR LoRA", size="sm")
                 msr_refresh_btn.click(fn=lambda: gr.update(choices=list_msr_loras()), outputs=[msr_lora_dd])
 
-                gr.Markdown("**🎯 Cài đặt MSR Guide**")
-                msr_guide_str_sl = gr.Slider(
-                    label="Reference strength", minimum=0.0, maximum=1.0, step=0.05, value=1.0,
-                    info="Độ bám ảnh tham khảo (tối đa 1.0) — 1.0 bám sát nhất")
+                gr.Markdown("**🎯 Cài đặt MSR Guide & Độ Tuân Thủ Prompt**")
+                with gr.Row():
+                    msr_video_cfg = gr.Slider(
+                        label="🎯 Video CFG (Độ tuân thủ Prompt)", minimum=1.0, maximum=3.5, step=0.1, value=1.5,
+                        info="Khuyến nghị 1.5 – 2.0 để AI bám sát hành động trong kịch bản", scale=1)
+                    msr_guide_str_sl = gr.Slider(
+                        label="Reference strength", minimum=0.0, maximum=1.0, step=0.05, value=0.7,
+                        info="Độ bám ảnh tham khảo — 0.7 chuẩn nhất (giữ nhân vật & chuyển động mượt)", scale=1)
                 with gr.Row():
                     msr_ref_frames = gr.Radio(
                         label="Reference frames", choices=["25", "33"], value="33",
@@ -760,7 +776,7 @@ with gr.Blocks(
             msr_pic1, msr_pic2, msr_pic3, msr_pic4, msr_bg,
             msr_relay_desc, msr_prompt, msr_neg,
             ratio_msr, length_msr, fps_msr, seed_msr, num_segments_msr, fixed_seed_msr,
-            msr_lora_dd, msr_lora_str_sl, msr_guide_str_sl,
+            msr_video_cfg, msr_lora_dd, msr_lora_str_sl, msr_guide_str_sl,
             msr_ref_frames, msr_tiled,
             msr_stage2, msr_low_vram,
         ],
