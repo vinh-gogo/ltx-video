@@ -353,11 +353,13 @@ def build_msr_workflow(
         "S1_ltxv_cond": {"class_type": "LTXVConditioning", "inputs": {"positive": ["S1_relay", 1], "negative": ["S1_neg_enc", 0], "frame_rate": ["S1_fps", 0]}},
     }
 
+    safe_msr_strength = min(1.0, max(0.0, float(msr_strength)))
+
     msr_s1 = {
         "positive": ["S1_ltxv_cond", 0], "negative": ["S1_ltxv_cond", 1],
         "vae": ["S1_vvae", 0], "latent": ["S1_empty_vid", 0],
         "msr_parameters": ["S1_msr_loader", 1],
-        "strength": float(msr_strength), "reference_frames": reference_frames,
+        "strength": safe_msr_strength, "reference_frames": reference_frames,
         "use_tiled_encode": use_tiled_encode, "tile_size": tile_size, "tile_overlap": 0,
     }
     for slot, img in pic_slot_map:
@@ -406,7 +408,7 @@ def build_msr_workflow(
         "positive": ["S2_relay", 1], "negative": ["S1_neg_enc", 0],
         "vae": ["S1_vvae", 0], "latent": ["S2_upsampler", 0],
         "msr_parameters": ["S1_msr_loader", 1],
-        "strength": float(msr_strength), "reference_frames": reference_frames,
+        "strength": safe_msr_strength, "reference_frames": reference_frames,
         "use_tiled_encode": use_tiled_encode, "tile_size": tile_size, "tile_overlap": 0,
     }
     for slot, img in pic_slot_map:
@@ -716,8 +718,8 @@ with gr.Blocks(
 
                 gr.Markdown("**🎯 Cài đặt MSR Guide**")
                 msr_guide_str_sl = gr.Slider(
-                    label="Reference strength", minimum=0.0, maximum=2.0, step=0.05, value=1.0,
-                    info="Độ bám ảnh tham khảo — 1.0 bám sát nhất")
+                    label="Reference strength", minimum=0.0, maximum=1.0, step=0.05, value=1.0,
+                    info="Độ bám ảnh tham khảo (tối đa 1.0) — 1.0 bám sát nhất")
                 with gr.Row():
                     msr_ref_frames = gr.Radio(
                         label="Reference frames", choices=["25", "33"], value="33",
