@@ -41,26 +41,6 @@ Giao diện trực quan tích hợp 3 luồng xử lý (Pipelines):
 
 ---
 
-## 📁 Cấu trúc thư mục
-
-```text
-ltx-video/
-├── download.py                         # [Cell 1] Tải model, cài ComfyUI & custom nodes
-├── ltx2_5.py                           # [Cell 2] LTX-2.5 Video Studio (T2V, I2V, FLF2V, Storyboard)
-├── ltx2_5_msr.py                       # [Cell MSR] MSR Studio (Multi-Subject Reference & Auto Stitched Script)
-├── LTX2.5-MSR-sample-workflow.json     # Workflow mẫu ComfyUI cho MSR
-├── kich_ban_msr_animal_comedy.md       # Kịch bản mẫu hài hước (Prompt + Lời thoại)
-├── msr_pic1_chef_cat.jpg               # Ảnh mẫu: Mèo đầu bếp (Pic 1)
-├── msr_pic2_corgi_puppy.jpg            # Ảnh mẫu: Cún Corgi (Pic 2)
-├── msr_pic3_raccoon_bandit.jpg         # Ảnh mẫu: Gấu mèo Raccoon (Pic 3)
-├── msr_pic4_hamster_agent.jpg          # Ảnh mẫu: Chuột Hamster (Pic 4)
-├── msr_bg_midnight_kitchen.jpg         # Ảnh mẫu: Bối cảnh bếp nửa đêm (Background)
-├── LICENSE                             # Giấy phép mã nguồn mở MIT
-└── README.md                           # Tài liệu hướng dẫn sử dụng
-```
-
----
-
 ## 💻 Yêu cầu phần cứng (Hardware Requirements)
 
 | Thành phần | Yêu cầu tối thiểu | Khuyến nghị (Tối ưu) |
