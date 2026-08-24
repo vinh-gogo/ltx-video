@@ -87,6 +87,11 @@ outputs/
 *.aac
 *.ogg
 
+# Whitelist demo assets & test videos
+!msr_midnight_snack_heist/
+!msr_midnight_snack_heist/output/
+!msr_midnight_snack_heist/output/*.mp4
+
 # ==============================================================================
 # Downloaders & Incomplete Files (aria2c / browsers)
 # ==============================================================================

@@ -480,7 +480,9 @@ TEXT_ENCODER_FILENAME     = globals().get("TEXT_ENCODER_FILENAME",     "gemma4-1
 VIDEO_VAE_FILENAME        = globals().get("VIDEO_VAE_FILENAME",        "ltx-2.5-video-vae-bf16.safetensors")
 AUDIO_VAE_FILENAME        = globals().get("AUDIO_VAE_FILENAME",        "ltx-2.5-audio-vae-bf16.safetensors")
 SPATIAL_UPSCALER_FILENAME = globals().get("SPATIAL_UPSCALER_FILENAME", "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors")
-MSR_LORA_FILENAME         = globals().get("MSR_LORA_FILENAME",         "ltx2.5/LTX-2.5-Licon-MSR-V1.safetensors")
+_raw_msr_lora             = globals().get("MSR_LORA_FILENAME",         "LTX-2.5-Licon-MSR-V1.safetensors")
+MSR_LORA_REL_PATH         = _raw_msr_lora if ("/" in _raw_msr_lora or "\\" in _raw_msr_lora) else f"{MSR_LORA_SUBDIR}/{_raw_msr_lora}"
+MSR_LORA_FILENAME         = MSR_LORA_REL_PATH
 # (MỚI) Model Gemma nhẹ dùng cho Prompt Enhancer — đã được Cell 1 tải sẵn
 # vào models/text_encoders/ (dùng chung với node TextGenerateLTX2Prompt của
 # workflow I2V gốc), giờ Cell MSR tái sử dụng, không cần tải thêm.
@@ -625,18 +627,30 @@ def list_msr_loras():
         for f in os.listdir(msr_dir)
         if f.lower().endswith((".safetensors", ".pt", ".ckpt"))
     )
-    return files if files else [MSR_LORA_FILENAME]
+    return files if files else [MSR_LORA_REL_PATH]
 
 
-def find_latest_video(output_dir=OUTPUT_DIR):
-    mp4_files = (
-        glob.glob(f"{output_dir}*.mp4")
-        + glob.glob(f"{output_dir}output/*.mp4")
-        + glob.glob(f"{output_dir}video/*.mp4")
-    )
+def find_latest_video(output_dir=OUTPUT_DIR, min_mtime=None):
+    """Tìm file video mới nhất trong output_dir và tất cả các thư mục con."""
+    mp4_files = []
+    exts = (".mp4", ".mkv", ".webm", ".mov")
+    if os.path.exists(output_dir):
+        for root, _, files in os.walk(output_dir):
+            for f in files:
+                if f.lower().endswith(exts):
+                    p = os.path.join(root, f)
+                    try:
+                        mt = os.path.getmtime(p)
+                        if min_mtime is None or mt >= (min_mtime - 10):
+                            mp4_files.append((mt, p))
+                    except OSError:
+                        pass
+    if not mp4_files and min_mtime is not None:
+        return find_latest_video(output_dir=output_dir, min_mtime=None)
     if not mp4_files:
         return None
-    return max(mp4_files, key=os.path.getmtime)
+    mp4_files.sort(key=lambda x: x[0], reverse=True)
+    return mp4_files[0][1]
 
 
 def split_prompts(text):
@@ -704,16 +718,56 @@ def submit_and_wait(workflow, scene_label="", max_wait_seconds=1800, poll_interv
             body = e.read().decode("utf-8")
         except Exception:
             body = str(e)
-        raise RuntimeError(f"ComfyUI tu choi workflow: {body[:800]}")
+        raise RuntimeError(f"ComfyUI từ chối workflow: {body[:800]}")
     except Exception as e:
-        raise RuntimeError(f"Loi gui job API: {e}")
+        raise RuntimeError(f"Lỗi gửi job API: {e}")
+
     waited = 0
+    history_url = f"http://127.0.0.1:8188/history/{prompt_id}"
     while waited < max_wait_seconds:
         try:
-            history = json.loads(urllib.request.urlopen(
-                urllib.request.Request(f"http://127.0.0.1:8188/history/{prompt_id}"), timeout=30).read())
+            history_resp = urllib.request.urlopen(urllib.request.Request(history_url), timeout=30)
+            history = json.loads(history_resp.read().decode("utf-8"))
+
             if str(prompt_id) in history:
+                job_data = history[str(prompt_id)]
+                status_info = job_data.get("status", {})
+                status_str = status_info.get("status_str", "")
+                completed = status_info.get("completed", False)
+                messages = status_info.get("messages", [])
+
+                # Kiểm tra chi tiết lỗi từ các node của ComfyUI
+                for msg in messages:
+                    if isinstance(msg, (list, tuple)) and len(msg) >= 2 and msg[0] == "execution_error":
+                        err_details = msg[1]
+                        node_id = err_details.get("node_id", "?")
+                        node_type = err_details.get("node_type", "?")
+                        exc_msg = err_details.get("exception_message", "Unknown execution error")
+                        exc_type = err_details.get("exception_type", "")
+                        tb = "".join(err_details.get("traceback", []))
+                        raise RuntimeError(
+                            f"Render thất bại ở {scene_label} tại node [{node_id}] ({node_type}): {exc_type} - {exc_msg}\n{tb[:300]}"
+                        )
+
+                if status_str == "error" or (not completed and "outputs" not in job_data):
+                    raise RuntimeError(f"ComfyUI báo lỗi không hoàn thành ở {scene_label}: {status_info}")
+
+                # Tìm trực tiếp đường dẫn file video đầu ra từ outputs của ComfyUI
+                outputs = job_data.get("outputs", {})
+                for node_id, node_out in outputs.items():
+                    for key in ("videos", "gifs", "images"):
+                        for item in node_out.get(key, []):
+                            fname = item.get("filename")
+                            if fname and fname.lower().endswith((".mp4", ".mkv", ".webm", ".mov")):
+                                subfolder = item.get("subfolder", "")
+                                out_type = item.get("type", "output")
+                                base_dir = "/content/ComfyUI/output" if out_type == "output" else "/content/ComfyUI/temp"
+                                file_path = os.path.join(base_dir, subfolder, fname) if subfolder else os.path.join(base_dir, fname)
+                                if os.path.exists(file_path):
+                                    return file_path
+
                 return prompt_id
+
             queue = json.loads(urllib.request.urlopen(
                 urllib.request.Request("http://127.0.0.1:8188/queue"), timeout=30).read())
             is_running = any(
@@ -721,14 +775,22 @@ def submit_and_wait(workflow, scene_label="", max_wait_seconds=1800, poll_interv
                 for job in queue.get("queue_running", []) + queue.get("queue_pending", [])
             )
             if not is_running:
-                raise RuntimeError(f"Render that bai o {scene_label}")
+                time.sleep(1)
+                hist_check = json.loads(urllib.request.urlopen(
+                    urllib.request.Request(history_url), timeout=30).read())
+                if str(prompt_id) in hist_check:
+                    continue
+                raise RuntimeError(f"Render thất bại ở {scene_label} (job không còn trong hàng đợi và không có output)")
+
         except RuntimeError:
             raise
         except Exception:
-            raise RuntimeError(f"Server bi crash o {scene_label}!")
+            pass
+
         time.sleep(poll_interval)
         waited += poll_interval
-    raise RuntimeError(f"Timeout: {scene_label} qua {max_wait_seconds // 60} phut.")
+
+    raise RuntimeError(f"Timeout: {scene_label} quá {max_wait_seconds // 60} phút.")
 
 
 # ==========================================================================
@@ -785,6 +847,7 @@ def build_msr_workflow(
 
     safe_fps       = snap_fps_safe(fps)
     half_w, half_h = half_dims(width, height)
+    total_frames   = int(safe_fps * int(duration) + 1)
 
     pic_slot_map = [
         ("pic1",       pic1_name),
@@ -801,13 +864,6 @@ def build_msr_workflow(
     # (id 380) của workflow I2V gốc — chỉ khác ảnh tham chiếu dùng Pic 1
     # (nhân vật chính) thay vì first_frame, vì MSR không có 1 ảnh khởi đầu
     # duy nhất.
-    #
-    # ⚠️ LƯU Ý: tên các input bên dưới (max_length, mode, temperature...) được
-    # suy ra từ thứ tự widgets_values của node TextGenerateLTX2Prompt trong
-    # workflow JSON gốc, KHÔNG phải lấy trực tiếp từ INPUT_TYPES của node.
-    # Nếu ComfyUI báo lỗi "unexpected input" khi submit, mở node này trong
-    # ComfyUI UI -> chuột phải -> "Node Info" để lấy đúng tên tham số rồi
-    # sửa lại dict enh_inputs bên dưới.
     enhancer_nodes = {}
     local_prompts_value = prompt_main
     if prompt_enhance:
@@ -816,20 +872,24 @@ def build_msr_workflow(
             "inputs": {"clip_name": TEXT_ENHANCER_FILENAME, "type": "ltxv", "device": "default"},
         }
         enh_inputs = {
-            "clip":                ["S1_enh_clip", 0],
-            "prompt":              prompt_main,
-            "max_length":          600,
-            "mode":                "on",
-            "temperature":         0.7,
-            "top_k":               64,
-            "top_p":               0.95,
-            "min_p":               0.05,
-            "repetition_penalty":  1.15,
-            "seed":                0,
+            "clip":                             ["S1_enh_clip", 0],
+            "prompt":                           prompt_main,
+            "max_length":                       600,
+            "sampling_mode":                    "on",
+            "sampling_mode.temperature":        0.7,
+            "sampling_mode.top_k":              64,
+            "sampling_mode.top_p":              0.95,
+            "sampling_mode.min_p":              0.05,
+            "sampling_mode.repetition_penalty": 1.15,
+            "sampling_mode.seed":               0,
+            "temperature":                      0.7,
+            "top_k":                            64,
+            "top_p":                            0.95,
+            "min_p":                            0.05,
+            "repetition_penalty":               1.15,
+            "seed":                             0,
         }
         if pic1_name:
-            # Dùng Pic 1 (nhân vật chính) làm ảnh tham chiếu cho enhancer,
-            # để mô tả sinh ra "nhìn thấy" nhân vật khi mở rộng prompt.
             enh_inputs["image"] = ["S1_load_pic1", 0]
         enhancer_nodes["S1_enh_gen"] = {"class_type": "TextGenerateLTX2Prompt", "inputs": enh_inputs}
         local_prompts_value = ["S1_enh_gen", 0]
@@ -845,12 +905,8 @@ def build_msr_workflow(
             "inputs": {"model": ["S1_unet", 0], "lora_name": msr_lora_name, "strength_model": float(msr_lora_strength)},
         },
         "S1_neg_enc":     {"class_type": "CLIPTextEncode", "inputs": {"clip": ["S1_clip", 0], "text": negative_text}},
-        "S1_width":       {"class_type": "INTConstant",    "inputs": {"value": half_w}},
-        "S1_height":      {"class_type": "INTConstant",    "inputs": {"value": half_h}},
-        "S1_fps":         {"class_type": "FloatConstant",  "inputs": {"value": float(safe_fps)}},
-        "S1_frames_expr": {"class_type": "ComfyMathExpression", "inputs": {"expression": "a*b+1", "values.a": ["S1_fps", 0], "values.b": int(duration)}},
-        "S1_empty_vid":   {"class_type": "EmptyLTXVLatentVideo",  "inputs": {"width": ["S1_width", 0], "height": ["S1_height", 0], "length": ["S1_frames_expr", 1], "batch_size": 1}},
-        "S1_empty_aud":   {"class_type": "LTXVEmptyLatentAudio",  "inputs": {"audio_vae": ["S1_avae", 0], "frames_number": ["S1_frames_expr", 1], "frame_rate": ["S1_fps", 0], "batch_size": 1}},
+        "S1_empty_vid":   {"class_type": "EmptyLTXVLatentVideo",  "inputs": {"width": int(half_w), "height": int(half_h), "length": int(total_frames), "batch_size": 1}},
+        "S1_empty_aud":   {"class_type": "LTXVEmptyLatentAudio",  "inputs": {"audio_vae": ["S1_avae", 0], "frames_number": int(total_frames), "frame_rate": float(safe_fps), "batch_size": 1}},
         "S1_relay": {
             "class_type": "PromptRelayEncode",
             "inputs": {
@@ -865,7 +921,7 @@ def build_msr_workflow(
         },
     }
     wf.update(enhancer_nodes)
-    wf["S1_ltxv_cond"] = {"class_type": "LTXVConditioning", "inputs": {"positive": ["S1_relay", 1], "negative": ["S1_neg_enc", 0], "frame_rate": ["S1_fps", 0]}}
+    wf["S1_ltxv_cond"] = {"class_type": "LTXVConditioning", "inputs": {"positive": ["S1_relay", 1], "negative": ["S1_neg_enc", 0], "frame_rate": float(safe_fps)}}
 
     safe_msr_strength = min(1.0, max(0.0, float(msr_strength)))
 
@@ -894,7 +950,7 @@ def build_msr_workflow(
         "S1_vae_decode":  {"class_type": "VAEDecode",             "inputs": {"samples": ["S1_crop_guides", 2], "vae": ["S1_vvae", 0]}},
         "S1_aud_decode":  {"class_type": "LTXVAudioVAEDecode",   "inputs": {"samples": ["S1_sep_av", 1], "audio_vae": ["S1_avae", 0]}},
         "S1_create_vid":  {"class_type": "CreateVideo",           "inputs": {"images": ["S1_vae_decode", 0], "audio": ["S1_aud_decode", 0], "fps": float(safe_fps)}},
-        "S1_save":        {"class_type": "SaveVideo",             "inputs": {"video": ["S1_create_vid", 0], "filename_prefix": "output/LTX25_MSR_Stage1", "format": "auto", "codec": "auto"}},
+        "S1_save":        {"class_type": "SaveVideo",             "inputs": {"video": ["S1_create_vid", 0], "filename_prefix": "LTX25_MSR_Stage1", "format": "auto", "codec": "auto"}},
     })
 
     if not run_stage2:
@@ -938,7 +994,7 @@ def build_msr_workflow(
     wf["S2_msr_guide"] = {"class_type": "ComfyUILTX25MSRMultiReferenceGuide", "inputs": msr_s2}
 
     wf.update({
-        "S2_ltxv_cond":   {"class_type": "LTXVConditioning",      "inputs": {"positive": ["S2_msr_guide", 0], "negative": ["S2_msr_guide", 1], "frame_rate": ["S1_fps", 0]}},
+        "S2_ltxv_cond":   {"class_type": "LTXVConditioning",      "inputs": {"positive": ["S2_msr_guide", 0], "negative": ["S2_msr_guide", 1], "frame_rate": float(safe_fps)}},
         "S2_concat_av":   {"class_type": "LTXVConcatAVLatent",   "inputs": {"video_latent": ["S2_msr_guide", 2], "audio_latent": ["S1_sep_av", 1]}},
         "S2_dual_guider": {"class_type": "LTXVDualCFGGuider",    "inputs": {"model": ["S2_relay", 0], "positive": ["S2_ltxv_cond", 0], "negative": ["S2_ltxv_cond", 1], "video_cfg": float(video_cfg), "audio_cfg": float(audio_cfg)}},
         "S2_noise":       {"class_type": "RandomNoise",           "inputs": {"noise_seed": stage2_seed}},
@@ -950,7 +1006,7 @@ def build_msr_workflow(
         "S2_vae_tiled":   {"class_type": "VAEDecodeTiled",        "inputs": {"samples": ["S2_crop_guides", 2], "vae": ["S1_vvae", 0], "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 16}},
         "S2_aud_decode":  {"class_type": "LTXVAudioVAEDecode",   "inputs": {"samples": ["S2_sep_av", 1], "audio_vae": ["S1_avae", 0]}},
         "S2_create_vid":  {"class_type": "CreateVideo",           "inputs": {"images": ["S2_vae_tiled", 0], "audio": ["S2_aud_decode", 0], "fps": float(safe_fps)}},
-        "S2_save":        {"class_type": "SaveVideo",             "inputs": {"video": ["S2_create_vid", 0], "filename_prefix": "output/LTX25_MSR_DualStage", "format": "auto", "codec": "auto"}},
+        "S2_save":        {"class_type": "SaveVideo",             "inputs": {"video": ["S2_create_vid", 0], "filename_prefix": "LTX25_MSR_DualStage", "format": "auto", "codec": "auto"}},
     })
 
     return wf
@@ -1055,14 +1111,23 @@ def generate_msr_gradio(
             run_stage2        = bool(run_stage2),
         )
 
+        job_t0 = time.time()
         try:
-            submit_and_wait(wf, scene_label=label)
+            res_video = submit_and_wait(wf, scene_label=label)
         except Exception as e:
             yield generated_videos, None, f"❌ {e}"; return
 
-        latest_video = find_latest_video()
-        if not latest_video:
-            yield generated_videos, None, f"⚠️ Không tìm thấy file video ở {label}!"; return
+        if isinstance(res_video, str) and os.path.exists(res_video) and not res_video.isdigit():
+            latest_video = res_video
+        else:
+            latest_video = find_latest_video(min_mtime=job_t0)
+
+        if not latest_video or not os.path.exists(latest_video):
+            yield generated_videos, None, (
+                f"⚠️ Không tìm thấy file video ở {label}!\n"
+                f"Kiểm tra lại log ComfyUI server trong terminal để xem chi tiết lỗi."
+            )
+            return
 
         generated_videos.append(latest_video)
         yield generated_videos, None, f"🔔 [DING] ✅ Xong {label} ({i + 1}/{total_scenes})!"
@@ -1135,11 +1200,10 @@ function(){
 # thị công khai trên header, thay vì giấu hoàn toàn sự phụ thuộc này.
 _msr_node_v, _relay_node_v = read_node_versions()
 
+custom_theme = gr.themes.Soft(primary_hue="violet", secondary_hue="purple", neutral_hue="slate")
+
 with gr.Blocks(
-    theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple", neutral_hue="slate"),
     title="LTX-2.5 MSR Studio",
-    css=custom_css,
-    js=notification_js,
     fill_width=True,
 ) as demo:
 
@@ -1244,13 +1308,26 @@ with gr.Blocks(
 
                 gr.Markdown("**🧬 MSR LoRA**")
                 with gr.Row():
+                    _msr_choices = list_msr_loras()
+                    _msr_default = _msr_choices[0] if _msr_choices else MSR_LORA_REL_PATH
                     msr_lora_dd = gr.Dropdown(
-                        label="MSR LoRA", choices=list_msr_loras(), value=MSR_LORA_FILENAME, scale=3)
+                        label="MSR LoRA",
+                        choices=_msr_choices,
+                        value=_msr_default,
+                        allow_custom_value=True,
+                        scale=3,
+                    )
                     msr_lora_str_sl = gr.Slider(
                         label="LoRA strength", minimum=0.0, maximum=2.0, step=0.05, value=0.85, scale=2,
                         info="0.85 = cân bằng hoàn hảo giữa nhận diện nhân vật & độ tự do chuyển động")
                 msr_refresh_btn = gr.Button("🔄 Refresh MSR LoRA", size="sm")
-                msr_refresh_btn.click(fn=lambda: gr.update(choices=list_msr_loras()), outputs=[msr_lora_dd])
+                msr_refresh_btn.click(
+                    fn=lambda: gr.update(
+                        choices=list_msr_loras(),
+                        value=list_msr_loras()[0] if list_msr_loras() else MSR_LORA_REL_PATH,
+                    ),
+                    outputs=[msr_lora_dd],
+                )
 
                 gr.Markdown("**🎯 Cài đặt MSR Guide & Độ Tuân Thủ Prompt**")
                 with gr.Row():
@@ -1321,4 +1398,14 @@ with gr.Blocks(
     )
 
 demo.queue()
-demo.launch(share=True, inline=False, debug=True)
+try:
+    demo.launch(
+        theme=custom_theme,
+        css=custom_css,
+        js=notification_js,
+        share=True,
+        inline=False,
+        debug=True,
+    )
+except TypeError:
+    demo.launch(share=True, inline=False, debug=True)
