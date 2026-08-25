@@ -103,6 +103,31 @@ if not HF_TOKEN:
 os.environ["HF_TOKEN"] = HF_TOKEN
 AUTH_HEADER = f"Authorization: Bearer {HF_TOKEN}"
 
+# Kiểm tra quyền truy cập repo Lightricks/LTX-2.5 ngay tại bước này
+try:
+    from huggingface_hub import HfApi
+    api = HfApi(token=HF_TOKEN)
+    api.model_info("Lightricks/LTX-2.5")
+    log("✅ Đã xác thực thành công quyền truy cập repo Lightricks/LTX-2.5!", color="#00e676")
+except Exception as _e:
+    _err_str = str(_e)
+    if "403" in _err_str or "gated" in _err_str.lower() or "access" in _err_str.lower():
+        log(
+            "⚠️ <b>TÀI KHOẢN CHƯA BẤM ACCEPT LICENSE!</b><br>"
+            "Repo <code>Lightricks/LTX-2.5</code> yêu cầu bạn phải bấm 'Agree and access repository' bằng tài khoản Hugging Face của token này:<br>"
+            "👉 <b>Mở link:</b> <a href='https://huggingface.co/Lightricks/LTX-2.5' target='_blank' style='color:#00e676;font-size:1.1rem;font-weight:bold;'>https://huggingface.co/Lightricks/LTX-2.5</a> và bấm nút <b>'Agree and access repository'</b>.<br>"
+            "Sau khi bấm xong, chạy lại Cell 1 là sẽ tải được ngay!",
+            color="#ff5252",
+        )
+    elif "401" in _err_str or "invalid" in _err_str.lower() or "token" in _err_str.lower():
+        log(
+            "⚠️ <b>HF_TOKEN KHÔNG HỢP LỆ HOẶC HẾT HẠN!</b><br>"
+            "Vui lòng tạo token mới tại: <a href='https://huggingface.co/settings/tokens' target='_blank'>https://huggingface.co/settings/tokens</a> (chọn quyền 'Read').",
+            color="#ff5252",
+        )
+    else:
+        print(f"Xác thực HF Token: {_err_str}")
+
 # Tải LoRA MSR (Multi-Subject Reference — LiconStudio MSR V1) cho Cell MSR (ltx2_5_msr.py)
 DOWNLOAD_MSR_LORA = True
 
@@ -349,7 +374,7 @@ def dl(url, dest, fname, connections=8, gated=False):
     Lightricks/LTX-2.5 vì repo yêu cầu đăng nhập + accept license)."""
     Path(dest).mkdir(parents=True, exist_ok=True)
     file_path = os.path.join(dest, fname)
-    if os.path.exists(file_path):
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 1024:
         with _print_lock:
             print(f"⏭️  Đã có sẵn, bỏ qua: {fname}")
         return True
@@ -357,6 +382,7 @@ def dl(url, dest, fname, connections=8, gated=False):
     with _print_lock:
         print(f"⬇️  Bắt đầu tải: {fname}")
 
+    # Lượt 1: Tải bằng aria2c
     cmd = [
         "aria2c", "--console-log-level=warn", "-c",
         "-x", str(connections), "-s", str(connections), "-k", "1M",
@@ -369,7 +395,26 @@ def dl(url, dest, fname, connections=8, gated=False):
     t0 = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True)
     elapsed = max(time.time() - t0, 0.01)
-    ok = result.returncode == 0 and os.path.exists(file_path)
+    ok = result.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 1024
+
+    # Lượt 2: Fallback sang huggingface_hub nếu aria2c không tải được
+    if not ok and "huggingface.co" in url:
+        try:
+            parts = url.split("huggingface.co/")[1].split("/resolve/main/")
+            repo_id = parts[0]
+            subpath = parts[1]
+            from huggingface_hub import hf_hub_download
+            downloaded = hf_hub_download(
+                repo_id=repo_id,
+                filename=subpath,
+                local_dir=dest,
+                token=HF_TOKEN if gated else None,
+            )
+            if os.path.exists(downloaded) and downloaded != file_path:
+                shutil.move(downloaded, file_path)
+            ok = os.path.exists(file_path) and os.path.getsize(file_path) > 1024
+        except Exception as _e:
+            pass
 
     with _print_lock:
         if ok:
@@ -377,11 +422,7 @@ def dl(url, dest, fname, connections=8, gated=False):
             print(f"✅ Xong: {fname}  ({size_mb:.0f}MB trong {elapsed:.0f}s, ~{size_mb / elapsed:.1f}MB/s)")
         else:
             _FAILED_DOWNLOADS.append(fname)
-            hint = ""
-            if gated and "401" in (result.stderr or "") or gated and "403" in (result.stderr or ""):
-                hint = (" (lỗi xác thực — kiểm tra lại HF_TOKEN và đã bấm 'Agree and access "
-                        "repository' đúng trang repo của file này chưa)")
-            print(f"⚠️ Tải thất bại: {fname}{hint}")
+            print(f"⚠️ Tải thất bại: {fname} -> Kiểm tra quyền Accept License tại https://huggingface.co/Lightricks/LTX-2.5")
     return ok
 
 
