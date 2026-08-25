@@ -179,15 +179,18 @@ sh("apt-get -y install -qq aria2 > /dev/null 2>&1")
 # --------------------------------------------------------------------------
 # [VRAM] Cấu hình chế độ bộ nhớ GPU THẬT cho ComfyUI (ghi sau khi ComfyUI đã clone)
 # --------------------------------------------------------------------------
-if GPU_VRAM_GB <= 16:
-    _vram_mode = "novram"       # giữ ít nhất có thể trên GPU, chậm nhất, an toàn nhất
+# Với model LTX-2.5 INT8 (UNET ~14GB, Gemma ~8GB), ComfyUI nạp tuần tự từng
+# model nên card ≥20GB (22GB, 24GB, 40GB, 80GB) chạy chế độ 'normal' ở TỐC ĐỘ TỐI ĐA
+# (~60-90s/cảnh). Chỉ card ≤16GB mới cần 'lowvram' / 'novram' (stream layer qua RAM).
+if GPU_VRAM_GB <= 12:
+    _vram_mode = "novram"       # GPU ≤12GB: stream triệt để qua RAM
     _reserve_vram_gb = 1.0
-elif GPU_VRAM_GB <= 30:
-    _vram_mode = "lowvram"      # phù hợp cho card ~20-24GB (vd trường hợp 22GB của bạn)
+elif GPU_VRAM_GB <= 18:
+    _vram_mode = "lowvram"      # GPU 16GB: stream nhẹ
     _reserve_vram_gb = 1.5
 else:
-    _vram_mode = "normal"       # đủ chỗ (≥32GB), không cần ép streaming layer
-    _reserve_vram_gb = 2.0
+    _vram_mode = "normal"       # GPU ≥20GB (như 22GB, 24GB, A10G, 4090): TỐC ĐỘ TỐI ĐA TRÊN GPU
+    _reserve_vram_gb = 1.5
 
 os.makedirs("/content/ComfyUI", exist_ok=True)
 with open("/content/ComfyUI/_vram_config.json", "w") as _vf:
@@ -199,20 +202,9 @@ with open("/content/ComfyUI/_vram_config.json", "w") as _vf:
 log(
     f"🧠 Chế độ VRAM: GPU khai báo {GPU_VRAM_GB}GB → chọn '--{_vram_mode}' "
     f"(reserve {_reserve_vram_gb}GB). Đã ghi vào "
-    f"/content/ComfyUI/_vram_config.json — Cell MSR (bản cập nhật) sẽ tự đọc "
-    f"file này làm mặc định mỗi khi khởi động server (chọn 'auto' trong UI).",
+    f"/content/ComfyUI/_vram_config.json.",
     color="#90caf9",
 )
-if _vram_mode != "normal":
-    log(
-        f"⚠️ Với UNET 22B (~22GB) + text encoder 12B (~12GB) cùng phải "
-        f"resident lúc mã hoá prompt, tổng ~34GB+ đã vượt {GPU_VRAM_GB}GB. "
-        f"'--{_vram_mode}' cho phép chạy được bằng cách stream layer qua RAM "
-        f"hệ thống, nhưng render sẽ CHẬM HƠN đáng kể so với GPU 40GB+ trở lên "
-        f"chạy chế độ bình thường. Đây là giới hạn vật lý, không phải do "
-        f"thiếu tối ưu ở Cell MSR.",
-        color="#ffb300",
-    )
 
 # --------------------------------------------------------------------------
 # [2/4] Clone/cập nhật custom nodes (ghim phiên bản node bên thứ ba)

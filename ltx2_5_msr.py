@@ -104,11 +104,9 @@ def read_node_versions():
 
 
 def read_vram_config():
-    """(MỚI) Đọc cấu hình VRAM do Cell 1 (bản cập nhật v2) ghi ra, dùng làm
-    mặc định khi khởi động ComfyUI server — thay cho cờ --cache-none dùng
-    sai (không giảm VRAM model) ở bản trước."""
+    """Đọc cấu hình VRAM do Cell 1 ghi ra, dùng làm mặc định khi khởi động ComfyUI server."""
     path = "/content/ComfyUI/_vram_config.json"
-    default = {"gpu_vram_gb": 22, "mode": "lowvram", "reserve_vram_gb": 1.5}
+    default = {"gpu_vram_gb": 22, "mode": "normal", "reserve_vram_gb": 1.5}
     try:
         with open(path) as f:
             data = json.load(f)
@@ -138,22 +136,15 @@ def _get_custom_nodes_mtime():
                     for sub in os.scandir(entry.path):
                         if sub.name.endswith(".py"):
                             mtimes.append(sub.stat().st_mtime)
-                except OSError:
+                except Exception:
                     pass
-        return max(mtimes) if mtimes else 0.0
-    except OSError:
-        return 0.0
+        return max(mtimes) if mtimes else 0
+    except Exception:
+        return 0
 
 
-def ensure_server(vram_mode_ui="auto", reserve_vram_gb=None, boot_timeout=300):
-    """Khởi động (hoặc khởi động lại nếu cần) ComfyUI server với đúng cờ VRAM.
-
-    (SỬA LỖI QUAN TRỌNG) Bản trước dùng --cache-none và gọi đó là "Low VRAM
-    Mode" — cờ đó chỉ tắt cache KẾT QUẢ NODE, không liên quan tới VRAM
-    model. Bản này dùng đúng cờ --lowvram / --novram của ComfyUI, ép model
-    stream trọng số qua RAM hệ thống theo từng lớp khi tính toán, giảm
-    thật sự VRAM đỉnh (đổi lại chậm hơn).
-
+def ensure_server(vram_mode_ui=None, reserve_vram_gb=None, boot_timeout=180):
+    """Khởi động ComfyUI server nếu chưa chạy hoặc cần đổi chế độ VRAM.
     vram_mode_ui: "auto" (dùng cấu hình từ Cell 1) | "novram" | "lowvram" | "normal"
     """
     resolved_mode = _VRAM_CONFIG_DEFAULT["mode"] if vram_mode_ui in (None, "auto") else vram_mode_ui
@@ -181,11 +172,12 @@ def ensure_server(vram_mode_ui="auto", reserve_vram_gb=None, boot_timeout=300):
         cmd.append("--novram")
     elif resolved_mode == "lowvram":
         cmd.append("--lowvram")
-    # resolved_mode == "normal" -> không thêm cờ streaming, để ComfyUI tự quyết định
-    if resolved_reserve:
+    # resolved_mode == "normal" -> chạy full tốc độ GPU
+    if resolved_reserve and resolved_mode != "normal":
         cmd += ["--reserve-vram", str(resolved_reserve)]
 
-    subprocess.Popen(cmd, env=server_env)
+    log_file = open("/content/comfyui.log", "a")
+    subprocess.Popen(cmd, env=server_env, stdout=log_file, stderr=subprocess.STDOUT)
     waited = 0
     while not is_server_running():
         time.sleep(2)
@@ -368,6 +360,20 @@ def submit_and_wait(workflow, scene_label="", max_wait_seconds=1800, poll_interv
     waited = 0
     history_url = f"http://127.0.0.1:8188/history/{prompt_id}"
     while waited < max_wait_seconds:
+        # Kiểm tra ngay nếu server ComfyUI bị dừng / sập đột ngột
+        if not is_server_running():
+            last_log = ""
+            if os.path.exists("/content/comfyui.log"):
+                try:
+                    with open("/content/comfyui.log", "r", errors="ignore") as lf:
+                        last_log = "".join(lf.readlines()[-40:])
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"❌ ComfyUI server bị dừng / crash đột ngột trong khi render {scene_label}!\n"
+                f"--- CHI TIẾT LOG TỪ SERVER ---\n{last_log if last_log else '(Không tìm thấy file log)'}"
+            )
+
         try:
             history_resp = urllib.request.urlopen(urllib.request.Request(history_url), timeout=30)
             history = json.loads(history_resp.read().decode("utf-8"))
@@ -389,7 +395,7 @@ def submit_and_wait(workflow, scene_label="", max_wait_seconds=1800, poll_interv
                         exc_type = err_details.get("exception_type", "")
                         tb = "".join(err_details.get("traceback", []))
                         raise RuntimeError(
-                            f"Render thất bại ở {scene_label} tại node [{node_id}] ({node_type}): {exc_type} - {exc_msg}\n{tb[:300]}"
+                            f"Render thất bại ở {scene_label} tại node [{node_id}] ({node_type}): {exc_type} - {exc_msg}\n{tb[:400]}"
                         )
 
                 if status_str == "error" or (not completed and "outputs" not in job_data):
@@ -1025,35 +1031,32 @@ with gr.Blocks(
 
                 gr.Markdown("**⚙️ Pipeline**")
                 with gr.Row():
-                    msr_stage2   = gr.Checkbox(label="✅ Chạy Stage 2 (upscale x2 + refine)", value=True)
+                    msr_stage2   = gr.Checkbox(label="✅ Chạy Stage 2 (upscale x2 + refine - BẬT để nét căng full HD, TẮT để render siêu tốc ~60s/cảnh)", value=True)
                 with gr.Row():
                     msr_prompt_enhance = gr.Checkbox(
                         label="✨ Prompt Enhancer",
                         value=False,
-                        info="Dùng model Gemma nhẹ (gemma4_e2b_it_bf16, đã tải sẵn ở Cell 1) để tự mở rộng "
-                             "mỗi phân cảnh ngắn thành mô tả điện ảnh chi tiết hơn trước khi render. "
-                             "An toàn dùng cùng GPU 22GB MIỄN LÀ chế độ VRAM bên dưới đang là "
-                             "'lowvram'/'novram' (model sẽ stream qua RAM thay vì cần full VRAM).",
+                        info="Dùng model Gemma nhẹ (gemma4_e2b_it_bf16) tự mở rộng prompt ngắn thành mô tả điện ảnh chi tiết hơn trước khi render.",
                     )
 
-                gr.Markdown("**🧠 Quản lý VRAM (cho GPU nhỏ / chạy nhiều cảnh liên tiếp)**")
+                gr.Markdown("**🧠 Quản lý VRAM & Tốc độ Render**")
                 gr.Markdown(
                     "<div class='info-box'>"
-                    "Đây là cờ VRAM THẬT của ComfyUI (khác <code>--cache-none</code> của bản trước, "
-                    "vốn chỉ tắt cache kết quả node chứ không giảm VRAM model)."
+                    "Với GPU 22GB (A10G, RTX 3090/4090), hãy để chế độ VRAM là <b>normal</b> (hoặc auto) để AI chạy hoàn toàn trên GPU ở tốc độ nhanh nhất (~60-90s/cảnh). "
+                    "Nếu GPU của bạn nhỏ hơn (≤16GB) mới cần chọn <b>lowvram</b>."
                     "</div>"
                 )
                 with gr.Row():
                     msr_vram_mode = gr.Radio(
                         label="Chế độ VRAM",
-                        choices=["auto", "novram", "lowvram", "normal"],
+                        choices=["auto", "normal", "lowvram", "novram"],
                         value="auto",
-                        info=f"'auto' = theo Cell 1 (hiện tại: --{_vram_cfg['mode']}). Với GPU 22GB, khuyến nghị 'lowvram'.",
+                        info=f"'auto' = theo Cell 1 (hiện tại: --{_vram_cfg['mode']}).",
                     )
                     msr_reserve_vram = gr.Slider(
                         label="Reserve VRAM (GB)", minimum=0.0, maximum=6.0, step=0.5,
-                        value=float(_vram_cfg.get("reserve_vram_gb", 2.0)),
-                        info="Chừa thêm bộ nhớ đệm cho hoạt động ngoài model — tăng lên nếu vẫn OOM.",
+                        value=float(_vram_cfg.get("reserve_vram_gb", 1.5)),
+                        info="Chừa bộ nhớ đệm cho hệ thống ngoài model.",
                     )
                 with gr.Row():
                     msr_free_between = gr.Checkbox(
