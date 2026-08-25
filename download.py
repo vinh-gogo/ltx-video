@@ -1,6 +1,34 @@
-# @title [Cell 1] Cài đặt môi trường ComfyUI + LTX-2.5
+# @title [Cell 1 - CẬP NHẬT v2] Cài đặt môi trường ComfyUI + LTX-2.5
+#
+# --- CẬP NHẬT SO VỚI BẢN TRƯỚC ---
+# 1) Ghim phiên bản (commit hash) cho 2 custom node BÊN THỨ BA dùng riêng
+#    cho Cell MSR: ComfyUI-LTX2.5-MSR (liconstudio) và ComfyUI-PromptRelay
+#    (kijai). Mặc định vẫn để None (tự "git pull" bản mới nhất, y như hành
+#    vi cũ) nhưng giờ sẽ CẢNH BÁO rõ ràng mỗi lần chạy, và in ra + lưu lại
+#    commit hash hiện tại để bạn dễ dàng ghim lại sau khi đã test ổn định.
+# 2) Ghi danh sách commit hash của mọi custom node ra
+#    /content/ComfyUI/_node_versions.json — Cell MSR (bản cập nhật) sẽ tự
+#    đọc file này để hiển thị công khai trên giao diện Gradio đang chạy
+#    node bản nào, thay vì "giấu" hoàn toàn sự phụ thuộc bên thứ ba.
+# 3) (MỚI) Cấu hình VRAM THẬT cho ComfyUI. Bản Cell MSR trước đây gọi
+#    "Low VRAM Mode" nhưng thực chất chỉ bật cờ --cache-none — cờ đó CHỈ
+#    tắt cache kết quả node (để không tính lại node giống hệt lần trước),
+#    KHÔNG liên quan gì tới việc giảm VRAM của model (UNET 22B, text
+#    encoder 12B...). Đây là lý do máy vẫn tràn VRAM dù đã bật "Low VRAM
+#    Mode" kể cả trên GPU 22GB-40GB. Cell này giờ khai báo đúng
+#    GPU_VRAM_GB của bạn, tự chọn cờ THẬT (--lowvram / --novram /
+#    --reserve-vram) và ghi ra /content/ComfyUI/_vram_config.json để
+#    Cell MSR (bản cập nhật) đọc lại khi khởi động server.
+#
+# Custom nodes cần thiết:
+#   - ComfyUI-LTX2.5-MSR   : https://github.com/liconstudio/ComfyUI-LTX2.5-MSR   (BÊN THỨ BA)
+#   - ComfyUI-PromptRelay   : https://github.com/kijai/ComfyUI-PromptRelay        (BÊN THỨ BA)
+#   - ComfyUI-KJNodes       : https://github.com/kijai/ComfyUI-KJNodes
+#
+# MSR LoRA đặt tại: /content/ComfyUI/models/loras/ltx2.5/
 
 import concurrent.futures
+import json
 import os
 import subprocess
 import threading
@@ -85,6 +113,30 @@ DOWNLOAD_CHARACTER_LORA = True
 DOWNLOAD_MSR_LORA = True  # LoRA Multi-Subject Reference (LiconStudio MSR V1) cho Cell MSR (ltx2_5_msr.py)
 
 # --------------------------------------------------------------------------
+# (Ghim phiên bản node bên thứ ba) — xem giải thích ở [2/4] bên dưới
+# --------------------------------------------------------------------------
+# ComfyUI-LTX2.5-MSR (liconstudio) và ComfyUI-PromptRelay (kijai) KHÔNG phải
+# node chính chủ Lightricks/ComfyUI. Mặc định để None -> mỗi lần chạy cell
+# này sẽ tự "git pull" lấy commit mới nhất của 2 repo đó, tiện khi mới thử
+# nghiệm nhưng có rủi ro: nếu tác giả đổi tên input/class_type, Cell MSR có
+# thể gãy đột ngột mà không báo trước.
+#
+# Cách ghim lại sau khi đã test workflow chạy ổn định:
+#   1) Chạy Cell 1 một lần, đọc commit hash được in ra trong log (dòng
+#      "commit hiện tại: xxxxxxx") hoặc mở file
+#      /content/ComfyUI/_node_versions.json.
+#   2) Dán commit hash đó vào 2 biến bên dưới, ví dụ MSR_NODE_PIN = "a1b2c3d".
+#   3) Chạy lại Cell 1 -> từ giờ luôn checkout đúng commit đã ghim, không tự
+#      đổi version nữa cho tới khi bạn chủ động sửa lại 2 biến này.
+MSR_NODE_PIN     = None  # vd: "a1b2c3d"  (ComfyUI-LTX2.5-MSR)
+PROMPT_RELAY_PIN = None  # vd: "9f8e7d6"  (ComfyUI-PromptRelay)
+
+# Khai báo đúng dung lượng VRAM GPU bạn đang chạy (xem ở Colab: Runtime >
+# Change runtime type, hoặc chạy !nvidia-smi ở 1 cell riêng) để cell tự
+# chọn cờ khởi động phù hợp cho ComfyUI: 16, 22, 24, 40, 80...
+GPU_VRAM_GB = 22
+
+# --------------------------------------------------------------------------
 # [1/4] Cài thư viện lõi + clone/cập nhật ComfyUI
 # --------------------------------------------------------------------------
 log("[1/4] Installing core dependencies...")
@@ -111,7 +163,45 @@ pip_install("-r /content/ComfyUI/requirements.txt")
 sh("apt-get -y install -qq aria2 > /dev/null 2>&1")
 
 # --------------------------------------------------------------------------
-# [2/4] Clone/cập nhật custom nodes
+# [VRAM] Cấu hình chế độ bộ nhớ GPU THẬT cho ComfyUI (ghi sau khi ComfyUI đã clone)
+# --------------------------------------------------------------------------
+if GPU_VRAM_GB <= 16:
+    _vram_mode = "novram"       # giữ ít nhất có thể trên GPU, chậm nhất, an toàn nhất
+    _reserve_vram_gb = 1.0
+elif GPU_VRAM_GB <= 30:
+    _vram_mode = "lowvram"      # phù hợp cho card ~20-24GB (vd trường hợp 22GB của bạn)
+    _reserve_vram_gb = 1.5
+else:
+    _vram_mode = "normal"       # đủ chỗ (≥32GB), không cần ép streaming layer
+    _reserve_vram_gb = 2.0
+
+os.makedirs("/content/ComfyUI", exist_ok=True)
+with open("/content/ComfyUI/_vram_config.json", "w") as _vf:
+    json.dump(
+        {"gpu_vram_gb": GPU_VRAM_GB, "mode": _vram_mode, "reserve_vram_gb": _reserve_vram_gb},
+        _vf, indent=2,
+    )
+
+log(
+    f"🧠 Chế độ VRAM: GPU khai báo {GPU_VRAM_GB}GB → chọn '--{_vram_mode}' "
+    f"(reserve {_reserve_vram_gb}GB). Đã ghi vào "
+    f"/content/ComfyUI/_vram_config.json — Cell MSR (bản cập nhật) sẽ tự đọc "
+    f"file này làm mặc định mỗi khi khởi động server (chọn 'auto' trong UI).",
+    color="#90caf9",
+)
+if _vram_mode != "normal":
+    log(
+        f"⚠️ Với UNET 22B (~22GB) + text encoder 12B (~12GB) cùng phải "
+        f"resident lúc mã hoá prompt, tổng ~34GB+ đã vượt {GPU_VRAM_GB}GB. "
+        f"'--{_vram_mode}' cho phép chạy được bằng cách stream layer qua RAM "
+        f"hệ thống, nhưng render sẽ CHẬM HƠN đáng kể so với GPU 40GB+ trở lên "
+        f"chạy chế độ bình thường. Đây là giới hạn vật lý, không phải do "
+        f"thiếu tối ưu ở Cell MSR.",
+        color="#ffb300",
+    )
+
+# --------------------------------------------------------------------------
+# [2/4] Clone/cập nhật custom nodes (ghim phiên bản node bên thứ ba)
 # --------------------------------------------------------------------------
 # LƯU Ý: các node lõi của pipeline LTX-2.5 (LTXVAddGuide, LTXVConcatAVLatent,
 # LTXVSeparateAVLatent, LTXVAudioVAEDecode...) giờ nằm trong CHÍNH ComfyUI
@@ -123,30 +213,100 @@ sh("apt-get -y install -qq aria2 > /dev/null 2>&1")
 # int8-convrot) phòng khi bạn muốn thử GGUF quant cộng đồng sau này.
 # LoraLoaderModelOnly (dùng để nạp LoRA giữ nhân vật ở Cell 2) là node LÕI có
 # sẵn trong ComfyUI, KHÔNG cần custom node riêng.
+#
 # ComfyUI-LTX2.5-MSR + ComfyUI-PromptRelay: cần cho Cell MSR (ltx2_5_msr.py)
 # — MSR Multi-Subject Reference, cho phép dùng tới 4 ảnh tham khảo nhân vật.
+# Đây là 2 node BÊN THỨ BA (không phải Lightricks/ComfyUI chính thức) nên
+# được xử lý riêng bên dưới: ghim phiên bản qua MSR_NODE_PIN/PROMPT_RELAY_PIN
+# nếu đã set, cảnh báo rõ ràng nếu chưa ghim.
+
+
+def get_git_commit(path):
+    """Lấy short commit hash hiện tại của 1 thư mục git — dùng để hiển thị
+    minh bạch đang chạy custom node bản nào, đặc biệt hữu ích với 2 node bên
+    thứ ba MSR/PromptRelay mà Cell MSR sẽ đọc lại và show lên UI."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.strip() if result.returncode == 0 else "?"
+    except Exception:
+        return "?"
+
+
+def checkout_node(repo_url, pinned_ref, is_thirdparty):
+    """Clone (nếu chưa có) rồi đưa custom node về đúng trạng thái mong muốn.
+
+    - pinned_ref được set (khác None) -> luôn checkout đúng commit/tag đó,
+      KHÔNG tự động đổi version dù chạy lại cell bao nhiêu lần. An toàn cho
+      pipeline đã test ổn định.
+    - pinned_ref = None -> giữ hành vi cũ: git pull lấy bản mới nhất mỗi lần
+      chạy cell. Nếu đây là node bên thứ ba (is_thirdparty=True), in cảnh
+      báo rõ ràng vì rủi ro tác giả đổi API làm gãy Cell MSR mà không báo
+      trước.
+    """
+    node_name = repo_url.rstrip("/").split("/")[-1]
+    exists = os.path.exists(node_name)
+
+    if not exists:
+        sh(f"git clone -q {repo_url}")
+
+    if pinned_ref:
+        sh(f"cd {node_name} && git fetch -q --all && git checkout -q {pinned_ref} && cd ..")
+        status = f"📌 ghim tại {pinned_ref}"
+    else:
+        if exists:
+            sh(f"cd {node_name} && git pull -q && cd ..")
+        status = "🔄 luôn lấy bản mới nhất (main, CHƯA ghim)"
+        if is_thirdparty:
+            log(
+                f"⚠️ {node_name} là custom node BÊN THỨ BA (không phải Lightricks/ComfyUI "
+                f"chính thức) và CHƯA được ghim phiên bản -> mỗi lần chạy lại Cell 1 có thể "
+                f"tự đổi sang commit mới, có rủi ro gãy Cell MSR nếu tác giả đổi API. Sau khi "
+                f"đã test workflow chạy ổn định, khuyến nghị ghim lại bằng commit hash in ra "
+                f"ngay bên dưới (điền vào MSR_NODE_PIN / PROMPT_RELAY_PIN ở đầu cell này).",
+                color="#ffb300",
+            )
+
+    commit = get_git_commit(node_name)
+    print(f"   → {node_name}: {status}  (commit hiện tại: {commit})")
+
+    req_file = f"{node_name}/requirements.txt"
+    if os.path.exists(req_file):
+        pip_install(f"-r {req_file}")
+
+    return node_name, commit
+
+
 log("[2/4] Cloning/updating custom nodes...")
 get_ipython().run_line_magic("cd", "-q /content/ComfyUI/custom_nodes")
 
 CUSTOM_NODES = [
-    "https://github.com/kijai/ComfyUI-KJNodes",
-    "https://github.com/city96/ComfyUI-GGUF",
-    "https://github.com/Lightricks/ComfyUI-LTXVideo/",
-    "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
-    "https://github.com/kijai/ComfyUI-MelBandRoFormer",
-    # --- MSR (Multi-Subject Reference — dùng cho Cell MSR ltx2_5_msr.py) ---
-    "https://github.com/liconstudio/ComfyUI-LTX2.5-MSR",
-    "https://github.com/kijai/ComfyUI-PromptRelay",
+    # (url, pinned_ref, is_thirdparty)
+    ("https://github.com/kijai/ComfyUI-KJNodes", None, False),
+    ("https://github.com/city96/ComfyUI-GGUF", None, False),
+    ("https://github.com/Lightricks/ComfyUI-LTXVideo/", None, False),
+    ("https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite", None, False),
+    ("https://github.com/kijai/ComfyUI-MelBandRoFormer", None, False),
+    # --- MSR (Multi-Subject Reference — dùng cho Cell MSR) — BÊN THỨ BA ---
+    ("https://github.com/liconstudio/ComfyUI-LTX2.5-MSR", MSR_NODE_PIN, True),
+    ("https://github.com/kijai/ComfyUI-PromptRelay", PROMPT_RELAY_PIN, True),
 ]
-for repo_url in CUSTOM_NODES:
-    node_name = repo_url.rstrip("/").split("/")[-1]
-    if os.path.exists(node_name):
-        sh(f"cd {node_name} && git pull -q && cd ..")
-    else:
-        sh(f"git clone -q {repo_url}")
-    req_file = f"{node_name}/requirements.txt"
-    if os.path.exists(req_file):
-        pip_install(f"-r {req_file}")
+
+NODE_COMMITS = {}
+for repo_url, pinned_ref, is_thirdparty in CUSTOM_NODES:
+    node_name, commit = checkout_node(repo_url, pinned_ref, is_thirdparty)
+    NODE_COMMITS[node_name] = commit
+
+with open("/content/ComfyUI/_node_versions.json", "w") as _vf:
+    json.dump(NODE_COMMITS, _vf, indent=2)
+log(
+    "📄 Đã ghi lại phiên bản các custom node vào "
+    "/content/ComfyUI/_node_versions.json — Cell MSR (bản cập nhật) sẽ tự "
+    "đọc file này và hiển thị công khai trên giao diện.",
+    color="#90caf9",
+)
 
 # --------------------------------------------------------------------------
 # [3/4] Tải model weights cho LTX-2.5 + LoRA giữ nhân vật (song song, có log tiến trình)
@@ -156,13 +316,17 @@ log("[3/4] Fetching LTX-2.5 model weights (this may take a while — tổng ~40G
 _FAILED_DOWNLOADS = []
 _print_lock = threading.Lock()
 
-# Tên file dùng chung cho toàn bộ notebook — Cell 2 đọc lại các biến này.
+# Tên file dùng chung cho toàn bộ notebook — Cell 2 / Cell MSR đọc lại các
+# biến này.
 # Cấu hình mặc định: bản "distilled" (đã tối ưu số bước, KHÔNG cần LoRA
 # distill riêng như pipeline LTX-2.3 cũ) — đây là cấu hình ComfyUI chính
 # thức khuyến nghị cho cả 3 workflow T2V/I2V/FLF2V.
 UNET_FILENAME = "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors"
 TEXT_ENCODER_FILENAME = "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors"
-TEXT_ENCODER_ENHANCER_FILENAME = "gemma4_e2b_it_bf16.safetensors"  # dùng riêng cho Prompt Enhancer, không phải dual-clip
+# Dùng riêng cho Prompt Enhancer (node TextGenerateLTX2Prompt trong workflow
+# I2V gốc, VÀ giờ cũng được Cell MSR bản cập nhật tái sử dụng cho tính năng
+# Prompt Enhancer tuỳ chọn của nó — không cần tải thêm gì).
+TEXT_ENCODER_ENHANCER_FILENAME = "gemma4_e2b_it_bf16.safetensors"
 VIDEO_VAE_FILENAME = "ltx-2.5-video-vae-bf16.safetensors"
 AUDIO_VAE_FILENAME = "ltx-2.5-audio-vae-bf16.safetensors"
 SPATIAL_UPSCALER_FILENAME = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
@@ -290,14 +454,29 @@ else:
         if DOWNLOAD_MSR_LORA else
         ""
     )
+    pin_note = (
+        "<br>📌 Phiên bản 2 custom node bên thứ ba (MSR/PromptRelay) đã được ghi vào "
+        "<code>_node_versions.json</code> — nếu Cell MSR đột nhiên báo lỗi node sau này, "
+        "kiểm tra file này trước, rồi cân nhắc ghim lại (MSR_NODE_PIN / PROMPT_RELAY_PIN) "
+        "về commit đang chạy ổn định."
+    )
+    vram_note = (
+        f"<br>🧠 Chế độ VRAM đã ghi vào <code>_vram_config.json</code>: "
+        f"<code>--{_vram_mode}</code> cho GPU {GPU_VRAM_GB}GB (reserve {_reserve_vram_gb}GB). "
+        f"Cell MSR sẽ tự dùng cấu hình này khi chọn 'auto' trong ô Chế độ VRAM."
+    )
     display(HTML(
         "<div style='padding:15px;background-color:#e8f5e9;border-left:5px solid #4caf50;"
         "border-radius:4px;color:#2e7d32;font-family:sans-serif;'>"
         "<b>✨ Initialization Complete!</b> Môi trường LTX-2.5 đã sẵn sàng."
         f"{lora_note}"
         f"{msr_note}"
+        f"{pin_note}"
+        f"{vram_note}"
         "<br><small>⚠️ Nhắc lại: transformer + text encoder chính ~37GB VRAM/weights — "
-        "cần GPU 24GB+ (L4/A100). Trên T4 16GB nhiều khả năng sẽ OOM dù bật Low VRAM Mode.</small>"
+        "cần GPU 40GB+ để chạy tốc độ bình thường. Trên GPU nhỏ hơn (16-30GB), Cell MSR sẽ tự "
+        "dùng --lowvram/--novram để CHẠY ĐƯỢC nhưng CHẬM HƠN đáng kể — đây là đánh đổi vật lý, "
+        "không phải lỗi.</small>"
         "<br><small>⚠️ LoRA Ingredients được train trên LTX-2.3; Lightricks xác nhận đa số "
         "LoRA/IC-LoRA 2.3 chạy được trên 2.5 nhưng khuyến cáo tự kiểm chứng chất lượng trước khi "
         "dùng cho công việc quan trọng.</small>"
