@@ -364,16 +364,24 @@ MSR_LORA_REPO = "LiconStudio/LTX-2.5-Multiple-Subject-Reference"
 MSR_LORA_FILENAME = "LTX-2.5-Licon-MSR-V1.safetensors"
 
 
-def dl(url, dest, fname, connections=8, gated=False):
+def dl(url, dest, fname, connections=8, gated=False, min_size_mb=100):
     """Tải 1 file bằng aria2c nếu chưa có. An toàn để gọi song song từ nhiều thread.
-    gated=True -> gắn header Authorization (bắt buộc cho mọi file trong
-    Lightricks/LTX-2.5 vì repo yêu cầu đăng nhập + accept license)."""
+    Tự động kiểm tra tính toàn vẹn (dung lượng tối thiểu) để phát hiện file hỏng/HTML error."""
     Path(dest).mkdir(parents=True, exist_ok=True)
     file_path = os.path.join(dest, fname)
-    if os.path.exists(file_path) and os.path.getsize(file_path) > 1024:
-        with _print_lock:
-            print(f"⏭️  Đã có sẵn, bỏ qua: {fname}")
-        return True
+    if os.path.exists(file_path):
+        curr_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        if curr_size_mb >= min_size_mb:
+            with _print_lock:
+                print(f"⏭️  Đã có sẵn & hợp lệ ({curr_size_mb:.0f}MB), bỏ qua: {fname}")
+            return True
+        else:
+            with _print_lock:
+                print(f"⚠️ Phát hiện file {fname} bị hỏng / tải dở ({curr_size_mb:.2f}MB < {min_size_mb}MB) -> Xóa để tải lại chuẩn...")
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
 
     with _print_lock:
         print(f"⬇️  Bắt đầu tải: {fname}")
@@ -391,7 +399,7 @@ def dl(url, dest, fname, connections=8, gated=False):
     t0 = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True)
     elapsed = max(time.time() - t0, 0.01)
-    ok = result.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 1024
+    ok = result.returncode == 0 and os.path.exists(file_path) and (os.path.getsize(file_path) / (1024 * 1024)) >= min_size_mb
 
     # Lượt 2: Fallback sang huggingface_hub nếu aria2c không tải được
     if not ok and "huggingface.co" in url:
@@ -408,7 +416,7 @@ def dl(url, dest, fname, connections=8, gated=False):
             )
             if os.path.exists(downloaded) and downloaded != file_path:
                 shutil.move(downloaded, file_path)
-            ok = os.path.exists(file_path) and os.path.getsize(file_path) > 1024
+            ok = os.path.exists(file_path) and (os.path.getsize(file_path) / (1024 * 1024)) >= min_size_mb
         except Exception as _e:
             pass
 
@@ -422,33 +430,33 @@ def dl(url, dest, fname, connections=8, gated=False):
     return ok
 
 
-# Danh sách file cần tải: (url, thư mục đích, tên file, có bị gate hay không)
+# Danh sách file cần tải: (url, thư mục đích, tên file, có bị gate hay không, dung lượng tối thiểu MB)
 DOWNLOAD_JOBS = [
     (f"https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/{UNET_FILENAME}",
-     "/content/ComfyUI/models/diffusion_models", UNET_FILENAME, True),
+     "/content/ComfyUI/models/diffusion_models", UNET_FILENAME, True, 5000),
     (f"https://huggingface.co/Lightricks/LTX-2.5/resolve/main/text_encoders/{TEXT_ENCODER_FILENAME}",
-     "/content/ComfyUI/models/text_encoders", TEXT_ENCODER_FILENAME, True),
+     "/content/ComfyUI/models/text_encoders", TEXT_ENCODER_FILENAME, True, 3000),
     (f"https://huggingface.co/Comfy-Org/gemma-4/resolve/main/text_encoders/{TEXT_ENCODER_ENHANCER_FILENAME}",
-     "/content/ComfyUI/models/text_encoders", TEXT_ENCODER_ENHANCER_FILENAME, False),
+     "/content/ComfyUI/models/text_encoders", TEXT_ENCODER_ENHANCER_FILENAME, False, 3000),
     (f"https://huggingface.co/Lightricks/LTX-2.5/resolve/main/vae/{VIDEO_VAE_FILENAME}",
-     "/content/ComfyUI/models/vae", VIDEO_VAE_FILENAME, True),
+     "/content/ComfyUI/models/vae", VIDEO_VAE_FILENAME, True, 500),
     (f"https://huggingface.co/Lightricks/LTX-2.5/resolve/main/vae/{AUDIO_VAE_FILENAME}",
-     "/content/ComfyUI/models/vae", AUDIO_VAE_FILENAME, True),
+     "/content/ComfyUI/models/vae", AUDIO_VAE_FILENAME, True, 100),
     (f"https://huggingface.co/Lightricks/LTX-2.5/resolve/main/latent_upscale_models/{SPATIAL_UPSCALER_FILENAME}",
-     "/content/ComfyUI/models/latent_upscale_models", SPATIAL_UPSCALER_FILENAME, True),
+     "/content/ComfyUI/models/latent_upscale_models", SPATIAL_UPSCALER_FILENAME, True, 400),
 ]
 
 if DOWNLOAD_MSR_LORA:
     DOWNLOAD_JOBS.append((
         f"https://huggingface.co/{MSR_LORA_REPO}/resolve/main/{MSR_LORA_FILENAME}",
-        "/content/ComfyUI/models/loras/ltx2.5", MSR_LORA_FILENAME, False,
+        "/content/ComfyUI/models/loras/ltx2.5", MSR_LORA_FILENAME, False, 500,
     ))
 else:
     log("ℹ️ DOWNLOAD_MSR_LORA=False -> bỏ qua tải LoRA MSR.", color="#90caf9")
 
 # Tải tối đa 3 file cùng lúc, 8 luồng/file.
 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-    futures = [executor.submit(dl, url, dest, fname, 8, gated) for url, dest, fname, gated in DOWNLOAD_JOBS]
+    futures = [executor.submit(dl, url, dest, fname, 8, gated, min_size) for url, dest, fname, gated, min_size in DOWNLOAD_JOBS]
     concurrent.futures.wait(futures)
 
 # --------------------------------------------------------------------------
