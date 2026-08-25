@@ -1,16 +1,44 @@
-# @title [Cell MSR] LTX-2.5 MSR — Multi-Subject Reference Video
+# @title [Cell MSR - CẬP NHẬT v3] LTX-2.5 MSR — Multi-Subject Reference Video
 # Gan cell nay vao Colab de tao video tu nhieu anh tham khao nhan vat.
-# Yeu cau: ComfyUI da cai san + Cell 1 (setup model) da chay truoc.
+# Yeu cau: ComfyUI da cai san + Cell 1 (ban cap nhat v2, co cau hinh VRAM
+# that + ghim phien ban custom node) da chay truoc.
 #
-# Custom nodes can thiet:
-#   - ComfyUI-LTX2.5-MSR   : https://github.com/liconstudio/ComfyUI-LTX2.5-MSR
-#   - ComfyUI-PromptRelay   : https://github.com/kijai/ComfyUI-PromptRelay
+# --- CẬP NHẬT SO VỚI BẢN TRƯỚC ---
+# 1) Prompt Enhancer (tuỳ chọn, mặc định TẮT) — tái sử dụng model Gemma
+#    nhẹ (gemma4_e2b_it_bf16) đã tải sẵn ở Cell 1. Khi bật, mỗi phân cảnh
+#    sẽ được tự động mở rộng thành mô tả điện ảnh chi tiết hơn trước khi
+#    đưa vào PromptRelayEncode, dùng Pic 1 làm ảnh tham chiếu nếu có.
+# 2) Hiển thị công khai commit hash hiện tại của 2 custom node BÊN THỨ BA
+#    (ComfyUI-LTX2.5-MSR, ComfyUI-PromptRelay), đọc từ
+#    /content/ComfyUI/_node_versions.json do Cell 1 ghi ra.
+# 3) (SỬA LỖI QUAN TRỌNG — VRAM) Bản trước gọi "Low VRAM Mode" nhưng chỉ
+#    bật cờ --cache-none, cờ đó CHỈ tắt cache kết quả node, KHÔNG giảm
+#    VRAM model — đây là lý do máy vẫn tràn VRAM dù đã bật, kể cả trên GPU
+#    22-40GB. Bản này:
+#      a) Đọc /content/ComfyUI/_vram_config.json do Cell 1 (bản cập nhật
+#         v2) ghi ra, dùng đúng cờ THẬT của ComfyUI: --lowvram / --novram
+#         + --reserve-vram (ép model stream trọng số qua RAM hệ thống
+#         theo từng lớp, giảm thật sự VRAM đỉnh, đổi lại chậm hơn).
+#      b) Thêm nút gọi API /free có sẵn của ComfyUI để chủ động giải
+#         phóng model khỏi VRAM GIỮA MỖI PHÂN CẢNH — quan trọng khi chạy
+#         chuỗi dài (vd 10 cảnh liên tiếp) để VRAM không tích tụ/phân
+#         mảnh dần theo thời gian.
+#      c) Chuyển VAEDecode ở Stage 1 sang VAEDecodeTiled — giảm đỉnh bộ
+#         nhớ hoạt động (activation) khi decode nhiều khung hình cùng lúc.
+#      d) Thêm tuỳ chọn "Restart server mỗi N cảnh" — khởi động lại hẳn
+#         tiến trình ComfyUI định kỳ trong chuỗi dài, để dọn sạch VRAM /
+#         tránh rò rỉ tích luỹ qua nhiều job liên tiếp.
+#
+# Custom nodes cần thiết:
+#   - ComfyUI-LTX2.5-MSR   : https://github.com/liconstudio/ComfyUI-LTX2.5-MSR   (BÊN THỨ BA)
+#   - ComfyUI-PromptRelay   : https://github.com/kijai/ComfyUI-PromptRelay        (BÊN THỨ BA)
 #   - ComfyUI-KJNodes       : https://github.com/kijai/ComfyUI-KJNodes
 #
-# MSR LoRA dat tai: /content/ComfyUI/models/loras/ltx2.5/
+# MSR LoRA đặt tại: /content/ComfyUI/models/loras/ltx2.5/
 
 get_ipython().system("pip install -q gradio opencv-python")
 
+import gc
 import glob
 import json
 import math
@@ -21,13 +49,12 @@ import shutil
 import socket
 import subprocess
 import time
+import urllib.parse
 import urllib.request
-
-import cv2
 import gradio as gr
 
 # ==========================================================================
-# CAU HINH
+# CẤU HÌNH
 # ==========================================================================
 INPUT_DIR  = "/content/ComfyUI/input/"
 OUTPUT_DIR = "/content/ComfyUI/output/"
@@ -42,6 +69,10 @@ SPATIAL_UPSCALER_FILENAME = globals().get("SPATIAL_UPSCALER_FILENAME", "ltx-2.5-
 _raw_msr_lora             = globals().get("MSR_LORA_FILENAME",         "LTX-2.5-Licon-MSR-V1.safetensors")
 MSR_LORA_REL_PATH         = _raw_msr_lora if ("/" in _raw_msr_lora or "\\" in _raw_msr_lora) else f"{MSR_LORA_SUBDIR}/{_raw_msr_lora}"
 MSR_LORA_FILENAME         = MSR_LORA_REL_PATH
+# Model Gemma nhẹ dùng cho Prompt Enhancer — đã được Cell 1 tải sẵn vào
+# models/text_encoders/ (dùng chung với node TextGenerateLTX2Prompt của
+# workflow I2V gốc), Cell MSR tái sử dụng, không cần tải thêm.
+TEXT_ENHANCER_FILENAME    = globals().get("TEXT_ENCODER_ENHANCER_FILENAME", "gemma4_e2b_it_bf16.safetensors")
 
 PASS2_FIXED_NOISE_SEED = 42
 LATENT_GROUP_FRAMES    = 8
@@ -58,12 +89,42 @@ NEGATIVE_PROMPT_DEFAULT = (
 )
 
 
+def read_node_versions():
+    """Đọc file version do Cell 1 ghi lại, để hiển thị công khai đang chạy
+    commit nào cho 2 custom node BÊN THỨ BA (MSR, PromptRelay)."""
+    path = "/content/ComfyUI/_node_versions.json"
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    msr_v = data.get("ComfyUI-LTX2.5-MSR", "?")
+    relay_v = data.get("ComfyUI-PromptRelay", "?")
+    return msr_v, relay_v
+
+
+def read_vram_config():
+    """(MỚI) Đọc cấu hình VRAM do Cell 1 (bản cập nhật v2) ghi ra, dùng làm
+    mặc định khi khởi động ComfyUI server — thay cho cờ --cache-none dùng
+    sai (không giảm VRAM model) ở bản trước."""
+    path = "/content/ComfyUI/_vram_config.json"
+    default = {"gpu_vram_gb": 22, "mode": "lowvram", "reserve_vram_gb": 1.5}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        default.update(data)
+    except Exception:
+        pass
+    return default
+
+
 def is_server_running(port=8188):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-_SERVER_STATE = {"running_low_vram": None, "custom_nodes_mtime": None}
+_SERVER_STATE = {"running_vram_mode": None, "custom_nodes_mtime": None}
+_VRAM_CONFIG_DEFAULT = read_vram_config()
 
 
 def _get_custom_nodes_mtime():
@@ -84,11 +145,24 @@ def _get_custom_nodes_mtime():
         return 0.0
 
 
-def ensure_server(low_vram, boot_timeout=300):
+def ensure_server(vram_mode_ui="auto", reserve_vram_gb=None, boot_timeout=300):
+    """Khởi động (hoặc khởi động lại nếu cần) ComfyUI server với đúng cờ VRAM.
+
+    (SỬA LỖI QUAN TRỌNG) Bản trước dùng --cache-none và gọi đó là "Low VRAM
+    Mode" — cờ đó chỉ tắt cache KẾT QUẢ NODE, không liên quan tới VRAM
+    model. Bản này dùng đúng cờ --lowvram / --novram của ComfyUI, ép model
+    stream trọng số qua RAM hệ thống theo từng lớp khi tính toán, giảm
+    thật sự VRAM đỉnh (đổi lại chậm hơn).
+
+    vram_mode_ui: "auto" (dùng cấu hình từ Cell 1) | "novram" | "lowvram" | "normal"
+    """
+    resolved_mode = _VRAM_CONFIG_DEFAULT["mode"] if vram_mode_ui in (None, "auto") else vram_mode_ui
+    resolved_reserve = reserve_vram_gb if reserve_vram_gb is not None else _VRAM_CONFIG_DEFAULT.get("reserve_vram_gb", 1.5)
+
     current_mtime = _get_custom_nodes_mtime()
     need_restart = (
         not is_server_running()
-        or _SERVER_STATE["running_low_vram"] != low_vram
+        or _SERVER_STATE["running_vram_mode"] != resolved_mode
         or _SERVER_STATE["custom_nodes_mtime"] != current_mtime
     )
     if not need_restart:
@@ -96,27 +170,57 @@ def ensure_server(low_vram, boot_timeout=300):
     os.system("fuser -k 8188/tcp")
     time.sleep(2)
     os.chdir("/content/ComfyUI")
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    cmd = ["python", "main.py"]
-    if low_vram:
-        cmd.insert(2, "--cache-none")
-    subprocess.Popen(cmd)
+    
+    server_env = os.environ.copy()
+    server_env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
+
+    # --cache-none: tắt cache KẾT QUẢ NODE
+    # --preview-method none: tắt preview latent tốn VRAM/RAM khi render hàng loạt
+    cmd = ["python", "main.py", "--cache-none", "--preview-method", "none", "--disable-auto-launch"]
+    if resolved_mode == "novram":
+        cmd.append("--novram")
+    elif resolved_mode == "lowvram":
+        cmd.append("--lowvram")
+    # resolved_mode == "normal" -> không thêm cờ streaming, để ComfyUI tự quyết định
+    if resolved_reserve:
+        cmd += ["--reserve-vram", str(resolved_reserve)]
+
+    subprocess.Popen(cmd, env=server_env)
     waited = 0
     while not is_server_running():
         time.sleep(2)
         waited += 2
         if waited > boot_timeout:
             raise RuntimeError(f"Server khong khoi dong duoc sau {boot_timeout}s.")
-    _SERVER_STATE["running_low_vram"] = low_vram
+    _SERVER_STATE["running_vram_mode"] = resolved_mode
     _SERVER_STATE["custom_nodes_mtime"] = current_mtime
 
 
 def force_restart_server():
     os.system("fuser -k 8188/tcp")
     time.sleep(2)
-    _SERVER_STATE["running_low_vram"] = None
+    _SERVER_STATE["running_vram_mode"] = None
     _SERVER_STATE["custom_nodes_mtime"] = None
+    gc.collect()
     return "Server da tat. Lan tao video tiep theo se tu khoi dong lai."
+
+
+def free_comfy_memory(unload_models=True, free_memory=True):
+    """(MỚI) Gọi endpoint /free có sẵn của ComfyUI (giống nút 'Unload
+    Models'/'Free memory' trên UI gốc) để chủ động giải phóng model khỏi
+    VRAM giữa các job. Hữu ích khi chạy liên tiếp nhiều phân cảnh (vd 10
+    cảnh) để tránh VRAM tích tụ/phân mảnh dần theo thời gian.
+    Trả về False (không raise lỗi) nếu server không hỗ trợ endpoint này —
+    an toàn để gọi "cho chắc" mà không làm gãy pipeline."""
+    gc.collect()
+    try:
+        data = json.dumps({"unload_models": unload_models, "free_memory": free_memory}).encode("utf-8")
+        req = urllib.request.Request("http://127.0.0.1:8188/free", data=data, method="POST")
+        urllib.request.urlopen(req, timeout=30)
+        gc.collect()
+        return True
+    except Exception:
+        return False
 
 
 def snap_fps_safe(fps):
@@ -358,19 +462,32 @@ def build_msr_workflow(
     reference_frames="33",
     use_tiled_encode=False,
     tile_size=256,
+    prompt_enhance=False,
     run_stage2=True,
 ):
     """Build workflow MSR 2-stage theo LTX2.5-MSR-sample-workflow.json kết hợp
     cơ chế LTXVDualCFGGuider từ ltx2_5.py giúp video tuân thủ cao theo Prompt.
 
     Stage 1: UNETLoader -> ComfyUILTX25MSRICLoRALoader
+             (tuỳ chọn) Prompt Enhancer: CLIPLoader (gemma nhẹ) ->
+             TextGenerateLTX2Prompt (dùng Pic 1 làm ảnh tham chiếu nếu có)
              PromptRelayEncode -> LTXVConditioning
              ComfyUILTX25MSRMultiReferenceGuide
-             LTXVDualCFGGuider (video_cfg / audio_cfg) -> SamplerCustomAdvanced -> SaveVideo (1/2 res)
+             LTXVDualCFGGuider (video_cfg / audio_cfg) -> SamplerCustomAdvanced
+             -> VAEDecodeTiled (SỬA: trước là VAEDecode thường, giờ tiled để
+             giảm đỉnh activation memory khi decode nhiều khung hình) -> SaveVideo (1/2 res)
 
-    Stage 2: LTXVLatentUpsampler -> PromptRelayEncode -> LTXVConditioning
+    Stage 2: LTXVLatentUpsampler -> PromptRelayEncode (dùng lại prompt đã
+             enhance ở Stage 1 nếu prompt_enhance=True, không chạy enhancer
+             lần 2) -> LTXVConditioning
              ComfyUILTX25MSRMultiReferenceGuide -> LTXVDualCFGGuider (video_cfg / audio_cfg)
              SamplerCustomAdvanced -> VAEDecodeTiled -> SaveVideo (full res)
+
+    (GHI CHÚ VRAM) Với --lowvram/--novram bật đúng ở ensure_server(), model
+    KHÔNG còn cần nằm trọn trong VRAM nữa (weights được stream theo lớp từ
+    RAM), nên việc Prompt Enhancer nạp thêm 1 CLIP nhỏ (gemma4_e2b) song
+    song với text encoder chính không còn là vấn đề nghiêm trọng như khi
+    chạy --normalvram/--highvram mặc định.
     """
     if negative_text is None:
         negative_text = NEGATIVE_PROMPT_DEFAULT
@@ -390,6 +507,43 @@ def build_msr_workflow(
         ("pic4",       pic4_name),
         ("background", background_name),
     ]
+
+    # ---- Prompt Enhancer — tuỳ chọn ----
+    # Tái sử dụng model Gemma nhẹ (TEXT_ENHANCER_FILENAME) đã tải sẵn ở
+    # Cell 1 để mở rộng prompt ngắn thành mô tả điện ảnh chi tiết hơn trước
+    # khi đưa vào PromptRelayEncode, giống hệt node TextGenerateLTX2Prompt
+    # (id 380) của workflow I2V gốc — chỉ khác ảnh tham chiếu dùng Pic 1
+    # (nhân vật chính) thay vì first_frame, vì MSR không có 1 ảnh khởi đầu
+    # duy nhất.
+    enhancer_nodes = {}
+    local_prompts_value = prompt_main
+    if prompt_enhance:
+        enhancer_nodes["S1_enh_clip"] = {
+            "class_type": "CLIPLoader",
+            "inputs": {"clip_name": TEXT_ENHANCER_FILENAME, "type": "ltxv", "device": "default"},
+        }
+        enh_inputs = {
+            "clip":                             ["S1_enh_clip", 0],
+            "prompt":                           prompt_main,
+            "max_length":                       600,
+            "sampling_mode":                    "on",
+            "sampling_mode.temperature":        0.7,
+            "sampling_mode.top_k":              64,
+            "sampling_mode.top_p":              0.95,
+            "sampling_mode.min_p":              0.05,
+            "sampling_mode.repetition_penalty": 1.15,
+            "sampling_mode.seed":               0,
+            "temperature":                      0.7,
+            "top_k":                            64,
+            "top_p":                            0.95,
+            "min_p":                            0.05,
+            "repetition_penalty":               1.15,
+            "seed":                             0,
+        }
+        if pic1_name:
+            enh_inputs["image"] = ["S1_load_pic1", 0]
+        enhancer_nodes["S1_enh_gen"] = {"class_type": "TextGenerateLTX2Prompt", "inputs": enh_inputs}
+        local_prompts_value = ["S1_enh_gen", 0]
 
     # ---- Stage 1: Generation (half resolution) ----
     wf = {
@@ -411,13 +565,14 @@ def build_msr_workflow(
                 "clip":            ["S1_clip", 0],
                 "latent":          ["S1_empty_vid", 0],
                 "global_prompt":   prompt_relay_desc or "",
-                "local_prompts":   prompt_main,
+                "local_prompts":   local_prompts_value,
                 "segment_lengths": "",
                 "epsilon":         0.001,
             },
         },
-        "S1_ltxv_cond": {"class_type": "LTXVConditioning", "inputs": {"positive": ["S1_relay", 1], "negative": ["S1_neg_enc", 0], "frame_rate": float(safe_fps)}},
     }
+    wf.update(enhancer_nodes)
+    wf["S1_ltxv_cond"] = {"class_type": "LTXVConditioning", "inputs": {"positive": ["S1_relay", 1], "negative": ["S1_neg_enc", 0], "frame_rate": float(safe_fps)}}
 
     safe_msr_strength = min(1.0, max(0.0, float(msr_strength)))
 
@@ -443,7 +598,9 @@ def build_msr_workflow(
         "S1_sample":      {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["S1_noise", 0], "guider": ["S1_dual_guider", 0], "sampler": ["S1_sampler_sel", 0], "sigmas": ["S1_sigmas", 0], "latent_image": ["S1_concat_av", 0]}},
         "S1_sep_av":      {"class_type": "LTXVSeparateAVLatent",  "inputs": {"av_latent": ["S1_sample", 0]}},
         "S1_crop_guides": {"class_type": "LTXVCropGuides",       "inputs": {"positive": ["S1_msr_guide", 0], "negative": ["S1_msr_guide", 1], "latent": ["S1_sep_av", 0]}},
-        "S1_vae_decode":  {"class_type": "VAEDecode",             "inputs": {"samples": ["S1_crop_guides", 2], "vae": ["S1_vvae", 0]}},
+        # (SỬA — VRAM) VAEDecode thường -> VAEDecodeTiled: giảm đỉnh bộ nhớ
+        # hoạt động khi decode toàn bộ total_frames cùng lúc ở nửa độ phân giải.
+        "S1_vae_decode":  {"class_type": "VAEDecodeTiled",       "inputs": {"samples": ["S1_crop_guides", 2], "vae": ["S1_vvae", 0], "tile_size": 256, "overlap": 32, "temporal_size": 32, "temporal_overlap": 8}},
         "S1_aud_decode":  {"class_type": "LTXVAudioVAEDecode",   "inputs": {"samples": ["S1_sep_av", 1], "audio_vae": ["S1_avae", 0]}},
         "S1_create_vid":  {"class_type": "CreateVideo",           "inputs": {"images": ["S1_vae_decode", 0], "audio": ["S1_aud_decode", 0], "fps": float(safe_fps)}},
         "S1_save":        {"class_type": "SaveVideo",             "inputs": {"video": ["S1_create_vid", 0], "filename_prefix": "LTX25_MSR_Stage1", "format": "auto", "codec": "auto"}},
@@ -463,7 +620,11 @@ def build_msr_workflow(
                 "clip":            ["S1_clip", 0],
                 "latent":          ["S2_upsampler", 0],
                 "global_prompt":   prompt_relay_desc or "",
-                "local_prompts":   prompt_main,
+                # Dùng lại đúng prompt (đã enhance nếu prompt_enhance=True)
+                # của Stage 1, KHÔNG chạy lại enhancer lần 2 — giữ mô tả
+                # chuyển động nhất quán giữa 2 pass và tiết kiệm 1 lượt
+                # inference của model Gemma.
+                "local_prompts":   local_prompts_value,
                 "segment_lengths": "",
                 "epsilon":         0.001,
             },
@@ -513,11 +674,13 @@ def generate_msr_gradio(
     aspect_ratio, v_length, v_fps, v_seed, num_segments, fixed_seed,
     video_cfg, msr_lora_name, msr_lora_strength, msr_strength,
     reference_frames, use_tiled_encode,
-    run_stage2, low_vram,
+    prompt_enhance,
+    run_stage2,
+    vram_mode_ui, reserve_vram_ui, free_mem_between_scenes, restart_every_n,
 ):
     if not pic1_path:
         yield None, None, "⚠️ Dạ anh vui lòng tải ít nhất ảnh Pic 1 (bắt buộc) giúp em nha!"; return
-    
+
     prompts = split_prompts(prompt_main)
     if not prompts:
         yield None, None, "⚠️ Dạ anh nhập giúp em ít nhất 1 dòng kịch bản (prompt) nha!"; return
@@ -527,7 +690,7 @@ def generate_msr_gradio(
 
     yield None, None, "🔄 Đang kiểm tra / khởi động ComfyUI server..."
     try:
-        ensure_server(low_vram)
+        ensure_server(vram_mode_ui, reserve_vram_ui)
     except Exception as e:
         yield None, None, f"❌ {e}"; return
 
@@ -560,16 +723,31 @@ def generate_msr_gradio(
     total_scenes = len(scene_prompts)
     total_seconds = total_scenes * int(v_length)
     stage_note = "Stage 1 + Stage 2 (upscale x2)" if run_stage2 else "Stage 1 only (preview)"
+    enhance_note = "✨ Prompt Enhancer: BẬT" if prompt_enhance else "Prompt Enhancer: tắt"
+    resolved_mode = _VRAM_CONFIG_DEFAULT["mode"] if vram_mode_ui == "auto" else vram_mode_ui
+    vram_note = f"🧠 VRAM: --{resolved_mode} (reserve {reserve_vram_ui}GB)"
 
     yield None, None, (
         f"✅ Server sẵn sàng. Bắt đầu tạo chuỗi {total_scenes} phân cảnh MSR (tổng {total_seconds}s)...\n"
-        f"📸 Ảnh tham khảo: {len(loaded)} slot · Chế độ: {stage_note} · Base Seed: {base_seed} · Video CFG: {video_cfg}"
+        f"📸 Ảnh tham khảo: {len(loaded)} slot · Chế độ: {stage_note} · {enhance_note} · {vram_note}\n"
+        f"Base Seed: {base_seed} · Video CFG: {video_cfg}"
     )
 
     generated_videos = []
     for i, p in enumerate(scene_prompts):
         label = f"phân cảnh {i + 1}/{total_scenes}"
         seed_i = base_seed if fixed_seed else (base_seed + i)
+
+        # (MỚI) Restart server định kỳ trong chuỗi dài để dọn sạch VRAM /
+        # tránh tích luỹ phân mảnh qua nhiều job liên tiếp. Chỉ áp dụng
+        # TRƯỚC khi bắt đầu 1 cảnh mới (không cắt ngang cảnh đang chạy).
+        if restart_every_n and int(restart_every_n) > 0 and i > 0 and i % int(restart_every_n) == 0:
+            yield generated_videos, None, f"🔄 Restart định kỳ ComfyUI server trước {label} (mỗi {int(restart_every_n)} cảnh)..."
+            force_restart_server()
+            try:
+                ensure_server(vram_mode_ui, reserve_vram_ui)
+            except Exception as e:
+                yield generated_videos, None, f"❌ {e}"; return
 
         yield generated_videos, None, (
             f"🔄 Đang quay {label} [{stage_note}]... (Seed: {seed_i})\n"
@@ -596,6 +774,7 @@ def generate_msr_gradio(
             msr_strength      = msr_strength,
             reference_frames  = str(reference_frames),
             use_tiled_encode  = bool(use_tiled_encode),
+            prompt_enhance    = bool(prompt_enhance),
             run_stage2        = bool(run_stage2),
         )
 
@@ -618,7 +797,15 @@ def generate_msr_gradio(
             return
 
         generated_videos.append(latest_video)
-        yield generated_videos, None, f"🔔 [DING] ✅ Xong {label} ({i + 1}/{total_scenes})!"
+
+        # (MỚI) Giải phóng VRAM giữa mỗi phân cảnh — quan trọng cho chuỗi
+        # dài (vd 10 cảnh) để tránh VRAM tích tụ/phân mảnh dần theo thời gian.
+        freed_note = ""
+        if free_mem_between_scenes:
+            ok = free_comfy_memory()
+            freed_note = " · 🧹 đã gọi /free" if ok else " · ⚠️ /free không khả dụng (bỏ qua)"
+
+        yield generated_videos, None, f"🔔 [DING] ✅ Xong {label} ({i + 1}/{total_scenes}){freed_note}!"
 
     # Ghép nối các phân cảnh thành 1 video dài hoàn chỉnh
     if len(generated_videos) > 1:
@@ -684,6 +871,11 @@ function(){
 }
 """
 
+# Đọc phiên bản 2 custom node bên thứ ba (ghi ra bởi Cell 1) để hiển thị
+# công khai trên header, cùng cấu hình VRAM đang dùng.
+_msr_node_v, _relay_node_v = read_node_versions()
+_vram_cfg = read_vram_config()
+
 custom_theme = gr.themes.Soft(primary_hue="violet", secondary_hue="purple", neutral_hue="slate")
 
 with gr.Blocks(
@@ -695,12 +887,21 @@ with gr.Blocks(
         with gr.Row():
             with gr.Column(scale=4):
                 gr.Markdown(
-                    """
+                    f"""
                     # 🎬 LTX-2.5 MSR Studio (Tạo Video Dài Tự Động)
                     Multi-Subject Reference — Tạo phim dài nhiều phân cảnh từ ảnh tham khảo nhân vật & bối cảnh
-                    
+
                     <div style="margin-top:4px; opacity:0.9; font-size:0.9rem;">
                     ⚡ LTX-2.5 · 🎭 Tối đa 4 nhân vật + 1 bối cảnh · 🎞️ Tự động render chuỗi kịch bản & ghép nối hoàn chỉnh bằng ffmpeg
+                    </div>
+                    <div style="margin-top:6px; opacity:0.75; font-size:0.78rem;">
+                    🔧 Custom node bên thứ ba (chưa phải node lõi ComfyUI/Lightricks) đang chạy:
+                    ComfyUI-LTX2.5-MSR@{_msr_node_v} · ComfyUI-PromptRelay@{_relay_node_v}
+                    — ghim/cập nhật ở Cell 1 (biến MSR_NODE_PIN / PROMPT_RELAY_PIN).
+                    </div>
+                    <div style="margin-top:4px; opacity:0.75; font-size:0.78rem;">
+                    🧠 VRAM mặc định từ Cell 1: --{_vram_cfg['mode']} cho GPU {_vram_cfg['gpu_vram_gb']}GB
+                    (reserve {_vram_cfg['reserve_vram_gb']}GB) — cờ THẬT, khác --cache-none của bản trước.
                     </div>
                     """
                 )
@@ -775,7 +976,7 @@ with gr.Blocks(
                 with gr.Row():
                     length_msr = gr.Slider(label="⏱️ Thời lượng MỖI cảnh (giây)", minimum=1, maximum=10, step=1, value=10)
                     fps_msr    = gr.Slider(label="🎞️ FPS", minimum=8, maximum=120, step=8, value=24)
-                
+
                 with gr.Row():
                     seed_msr = gr.Number(label="🎲 Seed (-1 = ngẫu nhiên)", value=-1, precision=0)
                     num_segments_msr = gr.Slider(
@@ -820,12 +1021,51 @@ with gr.Blocks(
                     msr_ref_frames = gr.Radio(
                         label="Reference frames", choices=["25", "33"], value="33",
                         info="33 = mặc định MSR chính thức")
-                    msr_tiled = gr.Checkbox(label="Tiled VAE encode", value=False)
+                    msr_tiled = gr.Checkbox(label="Tiled VAE encode (khuyến nghị BẬT chống tràn VRAM)", value=True)
 
                 gr.Markdown("**⚙️ Pipeline**")
                 with gr.Row():
                     msr_stage2   = gr.Checkbox(label="✅ Chạy Stage 2 (upscale x2 + refine)", value=True)
-                    msr_low_vram = gr.Checkbox(label="🧊 Low VRAM Mode", value=True)
+                with gr.Row():
+                    msr_prompt_enhance = gr.Checkbox(
+                        label="✨ Prompt Enhancer",
+                        value=False,
+                        info="Dùng model Gemma nhẹ (gemma4_e2b_it_bf16, đã tải sẵn ở Cell 1) để tự mở rộng "
+                             "mỗi phân cảnh ngắn thành mô tả điện ảnh chi tiết hơn trước khi render. "
+                             "An toàn dùng cùng GPU 22GB MIỄN LÀ chế độ VRAM bên dưới đang là "
+                             "'lowvram'/'novram' (model sẽ stream qua RAM thay vì cần full VRAM).",
+                    )
+
+                gr.Markdown("**🧠 Quản lý VRAM (cho GPU nhỏ / chạy nhiều cảnh liên tiếp)**")
+                gr.Markdown(
+                    "<div class='info-box'>"
+                    "Đây là cờ VRAM THẬT của ComfyUI (khác <code>--cache-none</code> của bản trước, "
+                    "vốn chỉ tắt cache kết quả node chứ không giảm VRAM model)."
+                    "</div>"
+                )
+                with gr.Row():
+                    msr_vram_mode = gr.Radio(
+                        label="Chế độ VRAM",
+                        choices=["auto", "novram", "lowvram", "normal"],
+                        value="auto",
+                        info=f"'auto' = theo Cell 1 (hiện tại: --{_vram_cfg['mode']}). Với GPU 22GB, khuyến nghị 'lowvram'.",
+                    )
+                    msr_reserve_vram = gr.Slider(
+                        label="Reserve VRAM (GB)", minimum=0.0, maximum=6.0, step=0.5,
+                        value=float(_vram_cfg.get("reserve_vram_gb", 2.0)),
+                        info="Chừa thêm bộ nhớ đệm cho hoạt động ngoài model — tăng lên nếu vẫn OOM.",
+                    )
+                with gr.Row():
+                    msr_free_between = gr.Checkbox(
+                        label="🧹 Giải phóng VRAM giữa mỗi phân cảnh (khuyến nghị BẬT cho ≥5 cảnh)",
+                        value=True,
+                        info="Gọi API /free của ComfyUI sau mỗi cảnh để tránh VRAM tích tụ/phân mảnh dần.",
+                    )
+                    msr_restart_every = gr.Slider(
+                        label="🔄 Restart server mỗi N cảnh (0 = tắt)",
+                        minimum=0, maximum=10, step=1, value=2,
+                        info="Khởi động lại ComfyUI định kỳ mỗi 2 cảnh (chỉ mất ~3s) để dọn sạch 100% rác VRAM & RAM khi quay chuỗi 10 cảnh.",
+                    )
 
         # --- CỘT PHẢI: OUTPUTS ---
         with gr.Column(scale=5):
@@ -840,11 +1080,13 @@ with gr.Blocks(
 
             gr.Markdown(
                 "<div class='info-box'>"
-                "<b>💡 Hướng dẫn tạo phim 30s–60s:</b><br>"
-                "• Bạn dán toàn bộ 3 phân đoạn trong kịch bản vào ô prompt (cách nhau 2 lần Enter).<br>"
-                "• Nhấn <b>Bắt Đầu Tạo Phim MSR</b>: hệ thống sẽ tự động chạy Shot 1 (10s) → Shot 2 (10s) → Shot 3 (10s) "
-                "rồi tự ghép lại thành 1 video 30s hoàn chỉnh!<br>"
-                "• Tất cả các cảnh đều đồng bộ giữ nguyên đúng nhân vật từ các ảnh tham khảo."
+                "<b>💡 Hướng dẫn tạo phim 30s–60s / chuỗi 10 cảnh:</b><br>"
+                "• Bạn dán toàn bộ các phân đoạn trong kịch bản vào ô prompt (cách nhau 2 lần Enter).<br>"
+                "• Nhấn <b>Bắt Đầu Tạo Phim MSR</b>: hệ thống tự động chạy lần lượt từng cảnh rồi tự ghép "
+                "lại thành 1 video hoàn chỉnh!<br>"
+                "• Với GPU 22GB và ≥5 cảnh: giữ 'Chế độ VRAM' = lowvram (hoặc auto nếu Cell 1 đã set 22GB), "
+                "bật 'Giải phóng VRAM giữa mỗi phân cảnh', và đặt 'Restart mỗi N cảnh' ~5 để chạy ổn định "
+                "cho 10 cảnh liên tiếp — đổi lại tốc độ sẽ chậm hơn GPU 40GB+."
                 "</div>"
             )
 
@@ -858,7 +1100,9 @@ with gr.Blocks(
             ratio_msr, length_msr, fps_msr, seed_msr, num_segments_msr, fixed_seed_msr,
             msr_video_cfg, msr_lora_dd, msr_lora_str_sl, msr_guide_str_sl,
             msr_ref_frames, msr_tiled,
-            msr_stage2, msr_low_vram,
+            msr_prompt_enhance,
+            msr_stage2,
+            msr_vram_mode, msr_reserve_vram, msr_free_between, msr_restart_every,
         ],
         outputs=[gallery_msr, video_out_msr, msr_status],
     )

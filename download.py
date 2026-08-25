@@ -136,10 +136,30 @@ PROMPT_RELAY_PIN = None  # vd: "9f8e7d6"  (ComfyUI-PromptRelay)
 # chọn cờ khởi động phù hợp cho ComfyUI: 16, 22, 24, 40, 80...
 GPU_VRAM_GB = 22
 
+def setup_swap(swap_gb=28):
+    """(CHỐNG SẬP BỘ NHỚ) Tạo file swap trên đĩa Colab để mở rộng RAM hệ thống thêm 28GB.
+    Khi chạy GPU 22GB với --lowvram/--novram, ComfyUI cần stream cả UNET 22B (~22GB) và
+    Gemma 12B (~12GB) tổng 34GB+ qua RAM. Swap đảm bảo Linux OOM Killer KHÔNG BAO GIỜ
+    tự động tắt (kill) server giữa chừng."""
+    try:
+        swap_path = "/content/swapfile"
+        if not os.path.exists(swap_path):
+            log(f"💾 [RAM Anti-OOM] Đang tạo {swap_gb}GB Virtual RAM (Swap) trên đĩa Colab...", color="#90caf9")
+            sh(f"fallocate -l {swap_gb}G {swap_path} || dd if=/dev/zero of={swap_path} bs=1M count={swap_gb * 1024}")
+            sh(f"chmod 600 {swap_path}")
+            sh(f"mkswap {swap_path} > /dev/null 2>&1")
+            sh(f"swapon {swap_path} > /dev/null 2>&1")
+            log(f"✅ Đã kích hoạt {swap_gb}GB Virtual RAM (Swap) thành công -> Chống tràn RAM khi chạy chuỗi dài!", color="#00e676")
+        else:
+            sh(f"swapon {swap_path} > /dev/null 2>&1")
+    except Exception as e:
+        print(f"Swap setup notice: {e}")
+
 # --------------------------------------------------------------------------
 # [1/4] Cài thư viện lõi + clone/cập nhật ComfyUI
 # --------------------------------------------------------------------------
-log("[1/4] Installing core dependencies...")
+log("[1/4] Installing core dependencies & setting up memory guard...")
+setup_swap(28)
 sh("pip install -q uv")  # cài uv trước, dùng cho mọi bước pip install sau này
 
 if torch_cuda_ready():
