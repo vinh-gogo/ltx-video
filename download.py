@@ -89,10 +89,7 @@ if not HF_TOKEN:
         "🔑 Chưa tìm thấy HF_TOKEN. Dán access token của bạn vào ô bên dưới "
         "(token này KHÔNG hiển thị ra màn hình). Lấy token tại: "
         "https://huggingface.co/settings/tokens — và nhớ bấm 'Agree and access "
-        "repository' tại CẢ HAI trang sau trước khi chạy tiếp:\n"
-        "  1) https://huggingface.co/Lightricks/LTX-2.5\n"
-        "  2) https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients "
-        "(nếu muốn dùng LoRA giữ nhân vật ở bước [3/4] bên dưới)",
+        "repository' tại: https://huggingface.co/Lightricks/LTX-2.5 trước khi chạy tiếp.",
         color="#ffb300",
     )
     HF_TOKEN = getpass("Dán Hugging Face token rồi nhấn Enter: ").strip()
@@ -106,11 +103,8 @@ if not HF_TOKEN:
 os.environ["HF_TOKEN"] = HF_TOKEN
 AUTH_HEADER = f"Authorization: Bearer {HF_TOKEN}"
 
-# Bật/tắt việc tải LoRA giữ nhân vật. Để False nếu bạn chỉ muốn dùng bản gốc
-# không LoRA, hoặc muốn tự upload LoRA của riêng bạn (đã train từ nhân vật cụ
-# thể) thẳng vào /content/ComfyUI/models/loras/ sau này.
-DOWNLOAD_CHARACTER_LORA = True
-DOWNLOAD_MSR_LORA = True  # LoRA Multi-Subject Reference (LiconStudio MSR V1) cho Cell MSR (ltx2_5_msr.py)
+# Tải LoRA MSR (Multi-Subject Reference — LiconStudio MSR V1) cho Cell MSR (ltx2_5_msr.py)
+DOWNLOAD_MSR_LORA = True
 
 # --------------------------------------------------------------------------
 # (Ghim phiên bản node bên thứ ba) — xem giải thích ở [2/4] bên dưới
@@ -351,13 +345,6 @@ VIDEO_VAE_FILENAME = "ltx-2.5-video-vae-bf16.safetensors"
 AUDIO_VAE_FILENAME = "ltx-2.5-audio-vae-bf16.safetensors"
 SPATIAL_UPSCALER_FILENAME = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
 
-# LoRA giữ đồng bộ nhân vật/props/bối cảnh xuyên suốt (IC-LoRA "Ingredients").
-# Repo: Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients (train trên 2.3, Lightricks
-# xác nhận đa số chạy tốt trên 2.5 nhưng khuyến cáo tự kiểm chứng).
-# Cường độ khuyến nghị chính chủ: strength = 1.0 (Cell 2 đặt sẵn mặc định này).
-CHARACTER_LORA_REPO = "Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients"
-CHARACTER_LORA_FILENAME = "ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors"
-
 # LoRA MSR (Multi-Subject Reference — dùng cho Cell MSR ltx2_5_msr.py).
 # Repo: LiconStudio/LTX-2.5-Multiple-Subject-Reference (hỗ trợ 1-5 ảnh tham khảo).
 MSR_LORA_REPO = "LiconStudio/LTX-2.5-Multiple-Subject-Reference"
@@ -367,8 +354,7 @@ MSR_LORA_FILENAME = "LTX-2.5-Licon-MSR-V1.safetensors"
 def dl(url, dest, fname, connections=8, gated=False):
     """Tải 1 file bằng aria2c nếu chưa có. An toàn để gọi song song từ nhiều thread.
     gated=True -> gắn header Authorization (bắt buộc cho mọi file trong
-    Lightricks/LTX-2.5 và Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients, vì cả 2
-    repo đều yêu cầu đăng nhập + accept license riêng)."""
+    Lightricks/LTX-2.5 vì repo yêu cầu đăng nhập + accept license)."""
     Path(dest).mkdir(parents=True, exist_ok=True)
     file_path = os.path.join(dest, fname)
     if os.path.exists(file_path):
@@ -423,17 +409,6 @@ DOWNLOAD_JOBS = [
      "/content/ComfyUI/models/latent_upscale_models", SPATIAL_UPSCALER_FILENAME, True),
 ]
 
-if DOWNLOAD_CHARACTER_LORA:
-    DOWNLOAD_JOBS.append((
-        f"https://huggingface.co/{CHARACTER_LORA_REPO}/resolve/main/{CHARACTER_LORA_FILENAME}",
-        "/content/ComfyUI/models/loras", CHARACTER_LORA_FILENAME, True,
-    ))
-else:
-    log("ℹ️ DOWNLOAD_CHARACTER_LORA=False -> bỏ qua tải LoRA giữ nhân vật. "
-        "Bạn có thể tự copy LoRA .safetensors của mình vào "
-        "/content/ComfyUI/models/loras/ rồi chọn trong dropdown ở Cell 2.",
-        color="#90caf9")
-
 if DOWNLOAD_MSR_LORA:
     DOWNLOAD_JOBS.append((
         f"https://huggingface.co/{MSR_LORA_REPO}/resolve/main/{MSR_LORA_FILENAME}",
@@ -451,23 +426,11 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
 # [4/4] Tổng kết
 # --------------------------------------------------------------------------
 if _FAILED_DOWNLOADS:
-    lora_hint = ""
-    if DOWNLOAD_CHARACTER_LORA and CHARACTER_LORA_FILENAME in _FAILED_DOWNLOADS:
-        lora_hint = (f"<br>⚠️ Riêng LoRA giữ nhân vật cần bạn bấm 'Agree and access repository' tại "
-                     f"https://huggingface.co/{CHARACTER_LORA_REPO} (đây là license RIÊNG, khác với "
-                     f"license của Lightricks/LTX-2.5).")
     log(f"⚠️ {len(_FAILED_DOWNLOADS)} file tải lỗi: {', '.join(_FAILED_DOWNLOADS)}. "
         f"Kiểm tra HF_TOKEN + đã accept license repo chưa, rồi chạy lại cell này "
-        f"(file đã tải xong sẽ tự bỏ qua) trước khi qua Cell 2.{lora_hint}",
+        f"(file đã tải xong sẽ tự bỏ qua) trước khi qua Cell 2.",
         color="#ff5252")
 else:
-    lora_note = (
-        "<br>🎭 LoRA giữ nhân vật (Ingredients IC-LoRA) đã sẵn sàng trong "
-        "<code>models/loras/</code> — chọn nó ở mục '🎭 LoRA giữ nhân vật/phong cách' trong Cell 2. "
-        "Cường độ khuyến nghị: 1.0."
-        if DOWNLOAD_CHARACTER_LORA else
-        "<br>ℹ️ Chưa tải LoRA giữ nhân vật (đã tắt DOWNLOAD_CHARACTER_LORA)."
-    )
     msr_note = (
         "<br>🧬 LoRA MSR (Licon MSR V1) đã sẵn sàng trong <code>models/loras/ltx2.5/</code> "
         "— dùng cho Cell MSR (<code>ltx2_5_msr.py</code>)."
