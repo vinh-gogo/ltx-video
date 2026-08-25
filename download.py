@@ -30,6 +30,7 @@
 import concurrent.futures
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -155,30 +156,25 @@ PROMPT_RELAY_PIN = None  # vd: "9f8e7d6"  (ComfyUI-PromptRelay)
 # chọn cờ khởi động phù hợp cho ComfyUI: 16, 22, 24, 40, 80...
 GPU_VRAM_GB = 22
 
-def setup_swap(swap_gb=28):
-    """(CHỐNG SẬP BỘ NHỚ) Tạo file swap trên đĩa Colab để mở rộng RAM hệ thống thêm 28GB.
-    Khi chạy GPU 22GB với --lowvram/--novram, ComfyUI cần stream cả UNET 22B (~22GB) và
-    Gemma 12B (~12GB) tổng 34GB+ qua RAM. Swap đảm bảo Linux OOM Killer KHÔNG BAO GIỜ
-    tự động tắt (kill) server giữa chừng."""
+def cleanup_and_optimize_disk():
+    """Giải phóng tối đa dung lượng ổ đĩa Colab (xóa swapfile cũ 28GB nếu có, dọn cache pip/tmp).
+    Vì GPU 22GB đã chạy chế độ 'normal' trực tiếp trên VRAM nên KHÔNG cần swapfile chiếm dung lượng đĩa."""
     try:
-        swap_path = "/content/swapfile"
-        if not os.path.exists(swap_path):
-            log(f"💾 [RAM Anti-OOM] Đang tạo {swap_gb}GB Virtual RAM (Swap) trên đĩa Colab...", color="#90caf9")
-            sh(f"fallocate -l {swap_gb}G {swap_path} || dd if=/dev/zero of={swap_path} bs=1M count={swap_gb * 1024}")
-            sh(f"chmod 600 {swap_path}")
-            sh(f"mkswap {swap_path} > /dev/null 2>&1")
-            sh(f"swapon {swap_path} > /dev/null 2>&1")
-            log(f"✅ Đã kích hoạt {swap_gb}GB Virtual RAM (Swap) thành công -> Chống tràn RAM khi chạy chuỗi dài!", color="#00e676")
-        else:
-            sh(f"swapon {swap_path} > /dev/null 2>&1")
-    except Exception as e:
-        print(f"Swap setup notice: {e}")
+        sh("swapoff /content/swapfile > /dev/null 2>&1")
+        if os.path.exists("/content/swapfile"):
+            os.remove("/content/swapfile")
+            log("🧹 Đã xóa /content/swapfile cũ để giải phóng 28GB ổ đĩa cho việc chứa Models!", color="#00e676")
+    except Exception:
+        pass
+    sh("rm -rf /root/.cache/pip /root/.cache/uv /tmp/pip-* /tmp/huggingface* > /dev/null 2>&1")
+    total, used, free = shutil.disk_usage("/")
+    log(f"💾 Dung lượng ổ đĩa Colab khả dụng: {free / (1024**3):.1f} GB trống / {total / (1024**3):.1f} GB", color="#90caf9")
 
 # --------------------------------------------------------------------------
 # [1/4] Cài thư viện lõi + clone/cập nhật ComfyUI
 # --------------------------------------------------------------------------
-log("[1/4] Installing core dependencies & setting up memory guard...")
-setup_swap(28)
+log("[1/4] Installing core dependencies & optimizing disk space...")
+cleanup_and_optimize_disk()
 sh("pip install -q uv")  # cài uv trước, dùng cho mọi bước pip install sau này
 
 if torch_cuda_ready():
