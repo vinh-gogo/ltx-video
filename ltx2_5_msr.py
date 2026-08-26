@@ -1,44 +1,16 @@
-# @title [Cell MSR - CẬP NHẬT v3] LTX-2.5 MSR — Multi-Subject Reference Video
+# @title [Cell MSR] LTX-2.5 MSR — Multi-Subject Reference Video
 # Gan cell nay vao Colab de tao video tu nhieu anh tham khao nhan vat.
-# Yeu cau: ComfyUI da cai san + Cell 1 (ban cap nhat v2, co cau hinh VRAM
-# that + ghim phien ban custom node) da chay truoc.
+# Yeu cau: ComfyUI da cai san + Cell 1 (setup model) da chay truoc.
 #
-# --- CẬP NHẬT SO VỚI BẢN TRƯỚC ---
-# 1) Prompt Enhancer (tuỳ chọn, mặc định TẮT) — tái sử dụng model Gemma
-#    nhẹ (gemma4_e2b_it_bf16) đã tải sẵn ở Cell 1. Khi bật, mỗi phân cảnh
-#    sẽ được tự động mở rộng thành mô tả điện ảnh chi tiết hơn trước khi
-#    đưa vào PromptRelayEncode, dùng Pic 1 làm ảnh tham chiếu nếu có.
-# 2) Hiển thị công khai commit hash hiện tại của 2 custom node BÊN THỨ BA
-#    (ComfyUI-LTX2.5-MSR, ComfyUI-PromptRelay), đọc từ
-#    /content/ComfyUI/_node_versions.json do Cell 1 ghi ra.
-# 3) (SỬA LỖI QUAN TRỌNG — VRAM) Bản trước gọi "Low VRAM Mode" nhưng chỉ
-#    bật cờ --cache-none, cờ đó CHỈ tắt cache kết quả node, KHÔNG giảm
-#    VRAM model — đây là lý do máy vẫn tràn VRAM dù đã bật, kể cả trên GPU
-#    22-40GB. Bản này:
-#      a) Đọc /content/ComfyUI/_vram_config.json do Cell 1 (bản cập nhật
-#         v2) ghi ra, dùng đúng cờ THẬT của ComfyUI: --lowvram / --novram
-#         + --reserve-vram (ép model stream trọng số qua RAM hệ thống
-#         theo từng lớp, giảm thật sự VRAM đỉnh, đổi lại chậm hơn).
-#      b) Thêm nút gọi API /free có sẵn của ComfyUI để chủ động giải
-#         phóng model khỏi VRAM GIỮA MỖI PHÂN CẢNH — quan trọng khi chạy
-#         chuỗi dài (vd 10 cảnh liên tiếp) để VRAM không tích tụ/phân
-#         mảnh dần theo thời gian.
-#      c) Chuyển VAEDecode ở Stage 1 sang VAEDecodeTiled — giảm đỉnh bộ
-#         nhớ hoạt động (activation) khi decode nhiều khung hình cùng lúc.
-#      d) Thêm tuỳ chọn "Restart server mỗi N cảnh" — khởi động lại hẳn
-#         tiến trình ComfyUI định kỳ trong chuỗi dài, để dọn sạch VRAM /
-#         tránh rò rỉ tích luỹ qua nhiều job liên tiếp.
-#
-# Custom nodes cần thiết:
-#   - ComfyUI-LTX2.5-MSR   : https://github.com/liconstudio/ComfyUI-LTX2.5-MSR   (BÊN THỨ BA)
-#   - ComfyUI-PromptRelay   : https://github.com/kijai/ComfyUI-PromptRelay        (BÊN THỨ BA)
+# Custom nodes can thiet:
+#   - ComfyUI-LTX2.5-MSR   : https://github.com/liconstudio/ComfyUI-LTX2.5-MSR
+#   - ComfyUI-PromptRelay   : https://github.com/kijai/ComfyUI-PromptRelay
 #   - ComfyUI-KJNodes       : https://github.com/kijai/ComfyUI-KJNodes
 #
-# MSR LoRA đặt tại: /content/ComfyUI/models/loras/ltx2.5/
+# MSR LoRA dat tai: /content/ComfyUI/models/loras/ltx2.5/
 
 get_ipython().system("pip install -q gradio opencv-python")
 
-import gc
 import glob
 import json
 import math
@@ -49,12 +21,13 @@ import shutil
 import socket
 import subprocess
 import time
-import urllib.parse
 import urllib.request
+
+import cv2
 import gradio as gr
 
 # ==========================================================================
-# CẤU HÌNH
+# CAU HINH
 # ==========================================================================
 INPUT_DIR  = "/content/ComfyUI/input/"
 OUTPUT_DIR = "/content/ComfyUI/output/"
@@ -66,13 +39,7 @@ TEXT_ENCODER_FILENAME     = globals().get("TEXT_ENCODER_FILENAME",     "gemma4-1
 VIDEO_VAE_FILENAME        = globals().get("VIDEO_VAE_FILENAME",        "ltx-2.5-video-vae-bf16.safetensors")
 AUDIO_VAE_FILENAME        = globals().get("AUDIO_VAE_FILENAME",        "ltx-2.5-audio-vae-bf16.safetensors")
 SPATIAL_UPSCALER_FILENAME = globals().get("SPATIAL_UPSCALER_FILENAME", "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors")
-_raw_msr_lora             = globals().get("MSR_LORA_FILENAME",         "LTX-2.5-Licon-MSR-V1.safetensors")
-MSR_LORA_REL_PATH         = _raw_msr_lora if ("/" in _raw_msr_lora or "\\" in _raw_msr_lora) else f"{MSR_LORA_SUBDIR}/{_raw_msr_lora}"
-MSR_LORA_FILENAME         = MSR_LORA_REL_PATH
-# Model Gemma nhẹ dùng cho Prompt Enhancer — đã được Cell 1 tải sẵn vào
-# models/text_encoders/ (dùng chung với node TextGenerateLTX2Prompt của
-# workflow I2V gốc), Cell MSR tái sử dụng, không cần tải thêm.
-TEXT_ENHANCER_FILENAME    = globals().get("TEXT_ENCODER_ENHANCER_FILENAME", "gemma4_e2b_it_bf16.safetensors")
+MSR_LORA_FILENAME         = globals().get("MSR_LORA_FILENAME",         "ltx2.5/LTX-2.5-Licon-MSR-V1.safetensors")
 
 PASS2_FIXED_NOISE_SEED = 42
 LATENT_GROUP_FRAMES    = 8
@@ -83,37 +50,12 @@ SIGMAS_PASS2 = "0.85, 0.7250, 0.4219, 0.0"
 NEGATIVE_PROMPT_DEFAULT = (
     "blurry, oversaturated, pixelated, low resolution, grainy, distorted, noise, "
     "compression artifacts, glitches, watermark, text, logo, subtitles, "
-    "static frame, frozen image, standing still, lack of motion, ignored prompt, "
-    "deformed limbs, extra paws, duplicate limbs, distorted face, inconsistent appearance, "
-    "mid-shot camera cut, character switching, sudden transition"
+    "static frame, frozen image, standing still, lack of motion, "
+    "deformed limbs, extra paws, duplicate limbs, distorted face, "
+    "character switching, sudden character change, wrong character, inconsistent character identity, "
+    "different person, different animal, character replacement, morphing face, "
+    "mid-shot camera cut, sudden transition, ignored prompt"
 )
-
-
-def read_node_versions():
-    """Đọc file version do Cell 1 ghi lại, để hiển thị công khai đang chạy
-    commit nào cho 2 custom node BÊN THỨ BA (MSR, PromptRelay)."""
-    path = "/content/ComfyUI/_node_versions.json"
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
-    msr_v = data.get("ComfyUI-LTX2.5-MSR", "?")
-    relay_v = data.get("ComfyUI-PromptRelay", "?")
-    return msr_v, relay_v
-
-
-def read_vram_config():
-    """Đọc cấu hình VRAM do Cell 1 ghi ra, dùng làm mặc định khi khởi động ComfyUI server."""
-    path = "/content/ComfyUI/_vram_config.json"
-    default = {"gpu_vram_gb": 22, "mode": "normal", "reserve_vram_gb": 1.5}
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        default.update(data)
-    except Exception:
-        pass
-    return default
 
 
 def is_server_running(port=8188):
@@ -121,8 +63,7 @@ def is_server_running(port=8188):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-_SERVER_STATE = {"running_vram_mode": None, "custom_nodes_mtime": None}
-_VRAM_CONFIG_DEFAULT = read_vram_config()
+_SERVER_STATE = {"running_low_vram": None, "custom_nodes_mtime": None}
 
 
 def _get_custom_nodes_mtime():
@@ -136,24 +77,18 @@ def _get_custom_nodes_mtime():
                     for sub in os.scandir(entry.path):
                         if sub.name.endswith(".py"):
                             mtimes.append(sub.stat().st_mtime)
-                except Exception:
+                except OSError:
                     pass
-        return max(mtimes) if mtimes else 0
-    except Exception:
-        return 0
+        return max(mtimes) if mtimes else 0.0
+    except OSError:
+        return 0.0
 
 
-def ensure_server(vram_mode_ui=None, reserve_vram_gb=None, boot_timeout=180):
-    """Khởi động ComfyUI server nếu chưa chạy hoặc cần đổi chế độ VRAM.
-    vram_mode_ui: "auto" (dùng cấu hình từ Cell 1) | "novram" | "lowvram" | "normal"
-    """
-    resolved_mode = _VRAM_CONFIG_DEFAULT["mode"] if vram_mode_ui in (None, "auto") else vram_mode_ui
-    resolved_reserve = reserve_vram_gb if reserve_vram_gb is not None else _VRAM_CONFIG_DEFAULT.get("reserve_vram_gb", 1.5)
-
+def ensure_server(low_vram, boot_timeout=300):
     current_mtime = _get_custom_nodes_mtime()
     need_restart = (
         not is_server_running()
-        or _SERVER_STATE["running_vram_mode"] != resolved_mode
+        or _SERVER_STATE["running_low_vram"] != low_vram
         or _SERVER_STATE["custom_nodes_mtime"] != current_mtime
     )
     if not need_restart:
@@ -161,58 +96,27 @@ def ensure_server(vram_mode_ui=None, reserve_vram_gb=None, boot_timeout=180):
     os.system("fuser -k 8188/tcp")
     time.sleep(2)
     os.chdir("/content/ComfyUI")
-    
-    server_env = os.environ.copy()
-    server_env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
-
-    # --cache-none: tắt cache KẾT QUẢ NODE
-    # --preview-method none: tắt preview latent tốn VRAM/RAM khi render hàng loạt
-    cmd = ["python", "main.py", "--cache-none", "--preview-method", "none", "--disable-auto-launch"]
-    if resolved_mode == "novram":
-        cmd.append("--novram")
-    elif resolved_mode == "lowvram":
-        cmd.append("--lowvram")
-    # resolved_mode == "normal" -> chạy full tốc độ GPU
-    if resolved_reserve and resolved_mode != "normal":
-        cmd += ["--reserve-vram", str(resolved_reserve)]
-
-    log_file = open("/content/comfyui.log", "a")
-    subprocess.Popen(cmd, env=server_env, stdout=log_file, stderr=subprocess.STDOUT)
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    cmd = ["python", "main.py"]
+    if low_vram:
+        cmd.insert(2, "--cache-none")
+    subprocess.Popen(cmd)
     waited = 0
     while not is_server_running():
         time.sleep(2)
         waited += 2
         if waited > boot_timeout:
             raise RuntimeError(f"Server khong khoi dong duoc sau {boot_timeout}s.")
-    _SERVER_STATE["running_vram_mode"] = resolved_mode
+    _SERVER_STATE["running_low_vram"] = low_vram
     _SERVER_STATE["custom_nodes_mtime"] = current_mtime
 
 
 def force_restart_server():
     os.system("fuser -k 8188/tcp")
     time.sleep(2)
-    _SERVER_STATE["running_vram_mode"] = None
+    _SERVER_STATE["running_low_vram"] = None
     _SERVER_STATE["custom_nodes_mtime"] = None
-    gc.collect()
     return "Server da tat. Lan tao video tiep theo se tu khoi dong lai."
-
-
-def free_comfy_memory(unload_models=True, free_memory=True):
-    """(MỚI) Gọi endpoint /free có sẵn của ComfyUI (giống nút 'Unload
-    Models'/'Free memory' trên UI gốc) để chủ động giải phóng model khỏi
-    VRAM giữa các job. Hữu ích khi chạy liên tiếp nhiều phân cảnh (vd 10
-    cảnh) để tránh VRAM tích tụ/phân mảnh dần theo thời gian.
-    Trả về False (không raise lỗi) nếu server không hỗ trợ endpoint này —
-    an toàn để gọi "cho chắc" mà không làm gãy pipeline."""
-    gc.collect()
-    try:
-        data = json.dumps({"unload_models": unload_models, "free_memory": free_memory}).encode("utf-8")
-        req = urllib.request.Request("http://127.0.0.1:8188/free", data=data, method="POST")
-        urllib.request.urlopen(req, timeout=30)
-        gc.collect()
-        return True
-    except Exception:
-        return False
 
 
 def snap_fps_safe(fps):
@@ -262,30 +166,71 @@ def list_msr_loras():
         for f in os.listdir(msr_dir)
         if f.lower().endswith((".safetensors", ".pt", ".ckpt"))
     )
-    return files if files else [MSR_LORA_REL_PATH]
+    return files if files else [MSR_LORA_FILENAME]
 
 
-def find_latest_video(output_dir=OUTPUT_DIR, min_mtime=None):
-    """Tìm file video mới nhất trong output_dir và tất cả các thư mục con."""
-    mp4_files = []
-    exts = (".mp4", ".mkv", ".webm", ".mov")
-    if os.path.exists(output_dir):
-        for root, _, files in os.walk(output_dir):
-            for f in files:
-                if f.lower().endswith(exts):
-                    p = os.path.join(root, f)
-                    try:
-                        mt = os.path.getmtime(p)
-                        if min_mtime is None or mt >= (min_mtime - 10):
-                            mp4_files.append((mt, p))
-                    except OSError:
-                        pass
-    if not mp4_files and min_mtime is not None:
-        return find_latest_video(output_dir=output_dir, min_mtime=None)
+def find_latest_video(output_dir=OUTPUT_DIR):
+    mp4_files = (
+        glob.glob(f"{output_dir}*.mp4")
+        + glob.glob(f"{output_dir}output/*.mp4")
+        + glob.glob(f"{output_dir}video/*.mp4")
+    )
     if not mp4_files:
         return None
-    mp4_files.sort(key=lambda x: x[0], reverse=True)
-    return mp4_files[0][1]
+    return max(mp4_files, key=os.path.getmtime)
+
+
+def get_video_duration(video_path):
+    """Lấy thời lượng thực tế của video (giây) bằng ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "format=duration",
+        "-of", "csv=p=0",
+        video_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return float(result.stdout.strip())
+    except Exception:
+        return None
+
+
+def trim_ref_frames(video_path, target_duration_s, fps, output_dir=OUTPUT_DIR):
+    """Cắt bỏ phần reference frames ở đầu video nếu LTXVCropGuides không crop đúng.
+
+    Nguyên lý: video output = [ref_frames] + [generated_frames]
+    Nếu tổng thời lượng thực tế > target_duration (prompt duration) thì phần
+    dư ở đầu chính là reference frames — dùng ffmpeg -ss để cắt đi.
+
+    Returns: đường dẫn video đã trim (hoặc video gốc nếu không cần trim).
+    """
+    actual = get_video_duration(video_path)
+    if actual is None:
+        return video_path  # không đọc được duration → trả gốc
+
+    margin = 1.0 / max(fps, 1)  # cho phép lệch ±1 frame
+    if actual <= target_duration_s + margin:
+        return video_path  # thời lượng đã đúng, không cần trim
+
+    # Thời điểm bắt đầu cần cắt (bỏ phần đầu reference)
+    trim_start = actual - target_duration_s
+    trimmed_path = video_path.rsplit(".", 1)[0] + "_trimmed.mp4"
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{trim_start:.4f}",
+        "-i", video_path,
+        "-c:v", "libx264", "-c:a", "aac",
+        "-pix_fmt", "yuv420p",
+        trimmed_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0 and os.path.exists(trimmed_path):
+        print(f"✂️  Đã trim {trim_start:.2f}s reference frames khỏi đầu video: {os.path.basename(trimmed_path)}")
+        return trimmed_path
+    # ffmpeg lỗi → trả gốc, không crash
+    print(f"⚠️  trim_ref_frames: ffmpeg lỗi, giữ nguyên video gốc.\n{result.stderr[:400]}")
+    return video_path
 
 
 def split_prompts(text):
@@ -353,70 +298,24 @@ def submit_and_wait(workflow, scene_label="", max_wait_seconds=1800, poll_interv
             body = e.read().decode("utf-8")
         except Exception:
             body = str(e)
-        raise RuntimeError(f"ComfyUI từ chối workflow: {body[:800]}")
+        raise RuntimeError(f"ComfyUI tu choi workflow: {body[:800]}")
     except Exception as e:
-        raise RuntimeError(f"Lỗi gửi job API: {e}")
+        raise RuntimeError(f"Loi gui job API: {e}")
 
     waited = 0
-    history_url = f"http://127.0.0.1:8188/history/{prompt_id}"
+    # Đếm lỗi liên tiếp — phân biệt network glitch tạm thời vs crash thật
+    # (Stage 2 upscale ngốn VRAM có thể làm server không phản hồi vài giây)
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 10  # ~20s lỗi liên tiếp mới coi là crash
+
     while waited < max_wait_seconds:
-        # Kiểm tra ngay nếu server ComfyUI bị dừng / sập đột ngột
-        if not is_server_running():
-            last_log = ""
-            if os.path.exists("/content/comfyui.log"):
-                try:
-                    with open("/content/comfyui.log", "r", errors="ignore") as lf:
-                        last_log = "".join(lf.readlines()[-40:])
-                except Exception:
-                    pass
-            raise RuntimeError(
-                f"❌ ComfyUI server bị dừng / crash đột ngột trong khi render {scene_label}!\n"
-                f"--- CHI TIẾT LOG TỪ SERVER ---\n{last_log if last_log else '(Không tìm thấy file log)'}"
-            )
-
         try:
-            history_resp = urllib.request.urlopen(urllib.request.Request(history_url), timeout=30)
-            history = json.loads(history_resp.read().decode("utf-8"))
-
+            history = json.loads(urllib.request.urlopen(
+                urllib.request.Request(f"http://127.0.0.1:8188/history/{prompt_id}"),
+                timeout=30).read())
+            consecutive_errors = 0  # reset khi poll thành công
             if str(prompt_id) in history:
-                job_data = history[str(prompt_id)]
-                status_info = job_data.get("status", {})
-                status_str = status_info.get("status_str", "")
-                completed = status_info.get("completed", False)
-                messages = status_info.get("messages", [])
-
-                # Kiểm tra chi tiết lỗi từ các node của ComfyUI
-                for msg in messages:
-                    if isinstance(msg, (list, tuple)) and len(msg) >= 2 and msg[0] == "execution_error":
-                        err_details = msg[1]
-                        node_id = err_details.get("node_id", "?")
-                        node_type = err_details.get("node_type", "?")
-                        exc_msg = err_details.get("exception_message", "Unknown execution error")
-                        exc_type = err_details.get("exception_type", "")
-                        tb = "".join(err_details.get("traceback", []))
-                        raise RuntimeError(
-                            f"Render thất bại ở {scene_label} tại node [{node_id}] ({node_type}): {exc_type} - {exc_msg}\n{tb[:400]}"
-                        )
-
-                if status_str == "error" or (not completed and "outputs" not in job_data):
-                    raise RuntimeError(f"ComfyUI báo lỗi không hoàn thành ở {scene_label}: {status_info}")
-
-                # Tìm trực tiếp đường dẫn file video đầu ra từ outputs của ComfyUI
-                outputs = job_data.get("outputs", {})
-                for node_id, node_out in outputs.items():
-                    for key in ("videos", "gifs", "images"):
-                        for item in node_out.get(key, []):
-                            fname = item.get("filename")
-                            if fname and fname.lower().endswith((".mp4", ".mkv", ".webm", ".mov")):
-                                subfolder = item.get("subfolder", "")
-                                out_type = item.get("type", "output")
-                                base_dir = "/content/ComfyUI/output" if out_type == "output" else "/content/ComfyUI/temp"
-                                file_path = os.path.join(base_dir, subfolder, fname) if subfolder else os.path.join(base_dir, fname)
-                                if os.path.exists(file_path):
-                                    return file_path
-
                 return prompt_id
-
             queue = json.loads(urllib.request.urlopen(
                 urllib.request.Request("http://127.0.0.1:8188/queue"), timeout=30).read())
             is_running = any(
@@ -424,22 +323,20 @@ def submit_and_wait(workflow, scene_label="", max_wait_seconds=1800, poll_interv
                 for job in queue.get("queue_running", []) + queue.get("queue_pending", [])
             )
             if not is_running:
-                time.sleep(1)
-                hist_check = json.loads(urllib.request.urlopen(
-                    urllib.request.Request(history_url), timeout=30).read())
-                if str(prompt_id) in hist_check:
-                    continue
-                raise RuntimeError(f"Render thất bại ở {scene_label} (job không còn trong hàng đợi và không có output)")
-
+                raise RuntimeError(f"Render that bai o {scene_label}")
         except RuntimeError:
             raise
         except Exception:
-            pass
-
+            # Network glitch / server đang giải phóng VRAM → không crash ngay
+            consecutive_errors += 1
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                raise RuntimeError(
+                    f"Server khong phan hoi sau {consecutive_errors * poll_interval}s lien tiep o {scene_label}!"
+                )
+            # else: im lặng, tiếp tục poll
         time.sleep(poll_interval)
         waited += poll_interval
-
-    raise RuntimeError(f"Timeout: {scene_label} quá {max_wait_seconds // 60} phút.")
+    raise RuntimeError(f"Timeout: {scene_label} qua {max_wait_seconds // 60} phut.")
 
 
 # ==========================================================================
@@ -468,32 +365,19 @@ def build_msr_workflow(
     reference_frames="33",
     use_tiled_encode=False,
     tile_size=256,
-    prompt_enhance=False,
     run_stage2=True,
 ):
     """Build workflow MSR 2-stage theo LTX2.5-MSR-sample-workflow.json kết hợp
     cơ chế LTXVDualCFGGuider từ ltx2_5.py giúp video tuân thủ cao theo Prompt.
 
     Stage 1: UNETLoader -> ComfyUILTX25MSRICLoRALoader
-             (tuỳ chọn) Prompt Enhancer: CLIPLoader (gemma nhẹ) ->
-             TextGenerateLTX2Prompt (dùng Pic 1 làm ảnh tham chiếu nếu có)
              PromptRelayEncode -> LTXVConditioning
              ComfyUILTX25MSRMultiReferenceGuide
-             LTXVDualCFGGuider (video_cfg / audio_cfg) -> SamplerCustomAdvanced
-             -> VAEDecodeTiled (SỬA: trước là VAEDecode thường, giờ tiled để
-             giảm đỉnh activation memory khi decode nhiều khung hình) -> SaveVideo (1/2 res)
+             LTXVDualCFGGuider (video_cfg / audio_cfg) -> SamplerCustomAdvanced -> SaveVideo (1/2 res)
 
-    Stage 2: LTXVLatentUpsampler -> PromptRelayEncode (dùng lại prompt đã
-             enhance ở Stage 1 nếu prompt_enhance=True, không chạy enhancer
-             lần 2) -> LTXVConditioning
+    Stage 2: LTXVLatentUpsampler -> PromptRelayEncode -> LTXVConditioning
              ComfyUILTX25MSRMultiReferenceGuide -> LTXVDualCFGGuider (video_cfg / audio_cfg)
              SamplerCustomAdvanced -> VAEDecodeTiled -> SaveVideo (full res)
-
-    (GHI CHÚ VRAM) Với --lowvram/--novram bật đúng ở ensure_server(), model
-    KHÔNG còn cần nằm trọn trong VRAM nữa (weights được stream theo lớp từ
-    RAM), nên việc Prompt Enhancer nạp thêm 1 CLIP nhỏ (gemma4_e2b) song
-    song với text encoder chính không còn là vấn đề nghiêm trọng như khi
-    chạy --normalvram/--highvram mặc định.
     """
     if negative_text is None:
         negative_text = NEGATIVE_PROMPT_DEFAULT
@@ -504,7 +388,6 @@ def build_msr_workflow(
 
     safe_fps       = snap_fps_safe(fps)
     half_w, half_h = half_dims(width, height)
-    total_frames   = int(safe_fps * int(duration) + 1)
 
     pic_slot_map = [
         ("pic1",       pic1_name),
@@ -513,43 +396,6 @@ def build_msr_workflow(
         ("pic4",       pic4_name),
         ("background", background_name),
     ]
-
-    # ---- Prompt Enhancer — tuỳ chọn ----
-    # Tái sử dụng model Gemma nhẹ (TEXT_ENHANCER_FILENAME) đã tải sẵn ở
-    # Cell 1 để mở rộng prompt ngắn thành mô tả điện ảnh chi tiết hơn trước
-    # khi đưa vào PromptRelayEncode, giống hệt node TextGenerateLTX2Prompt
-    # (id 380) của workflow I2V gốc — chỉ khác ảnh tham chiếu dùng Pic 1
-    # (nhân vật chính) thay vì first_frame, vì MSR không có 1 ảnh khởi đầu
-    # duy nhất.
-    enhancer_nodes = {}
-    local_prompts_value = prompt_main
-    if prompt_enhance:
-        enhancer_nodes["S1_enh_clip"] = {
-            "class_type": "CLIPLoader",
-            "inputs": {"clip_name": TEXT_ENHANCER_FILENAME, "type": "ltxv", "device": "default"},
-        }
-        enh_inputs = {
-            "clip":                             ["S1_enh_clip", 0],
-            "prompt":                           prompt_main,
-            "max_length":                       600,
-            "sampling_mode":                    "on",
-            "sampling_mode.temperature":        0.7,
-            "sampling_mode.top_k":              64,
-            "sampling_mode.top_p":              0.95,
-            "sampling_mode.min_p":              0.05,
-            "sampling_mode.repetition_penalty": 1.15,
-            "sampling_mode.seed":               0,
-            "temperature":                      0.7,
-            "top_k":                            64,
-            "top_p":                            0.95,
-            "min_p":                            0.05,
-            "repetition_penalty":               1.15,
-            "seed":                             0,
-        }
-        if pic1_name:
-            enh_inputs["image"] = ["S1_load_pic1", 0]
-        enhancer_nodes["S1_enh_gen"] = {"class_type": "TextGenerateLTX2Prompt", "inputs": enh_inputs}
-        local_prompts_value = ["S1_enh_gen", 0]
 
     # ---- Stage 1: Generation (half resolution) ----
     wf = {
@@ -562,8 +408,12 @@ def build_msr_workflow(
             "inputs": {"model": ["S1_unet", 0], "lora_name": msr_lora_name, "strength_model": float(msr_lora_strength)},
         },
         "S1_neg_enc":     {"class_type": "CLIPTextEncode", "inputs": {"clip": ["S1_clip", 0], "text": negative_text}},
-        "S1_empty_vid":   {"class_type": "EmptyLTXVLatentVideo",  "inputs": {"width": int(half_w), "height": int(half_h), "length": int(total_frames), "batch_size": 1}},
-        "S1_empty_aud":   {"class_type": "LTXVEmptyLatentAudio",  "inputs": {"audio_vae": ["S1_avae", 0], "frames_number": int(total_frames), "frame_rate": float(safe_fps), "batch_size": 1}},
+        "S1_width":       {"class_type": "INTConstant",    "inputs": {"value": half_w}},
+        "S1_height":      {"class_type": "INTConstant",    "inputs": {"value": half_h}},
+        "S1_fps":         {"class_type": "FloatConstant",  "inputs": {"value": float(safe_fps)}},
+        "S1_frames_expr": {"class_type": "ComfyMathExpression", "inputs": {"expression": "a*b+1", "values.a": ["S1_fps", 0], "values.b": int(duration)}},
+        "S1_empty_vid":   {"class_type": "EmptyLTXVLatentVideo",  "inputs": {"width": ["S1_width", 0], "height": ["S1_height", 0], "length": ["S1_frames_expr", 1], "batch_size": 1}},
+        "S1_empty_aud":   {"class_type": "LTXVEmptyLatentAudio",  "inputs": {"audio_vae": ["S1_avae", 0], "frames_number": ["S1_frames_expr", 1], "frame_rate": ["S1_fps", 0], "batch_size": 1}},
         "S1_relay": {
             "class_type": "PromptRelayEncode",
             "inputs": {
@@ -571,14 +421,13 @@ def build_msr_workflow(
                 "clip":            ["S1_clip", 0],
                 "latent":          ["S1_empty_vid", 0],
                 "global_prompt":   prompt_relay_desc or "",
-                "local_prompts":   local_prompts_value,
+                "local_prompts":   prompt_main,
                 "segment_lengths": "",
                 "epsilon":         0.001,
             },
         },
+        "S1_ltxv_cond": {"class_type": "LTXVConditioning", "inputs": {"positive": ["S1_relay", 1], "negative": ["S1_neg_enc", 0], "frame_rate": ["S1_fps", 0]}},
     }
-    wf.update(enhancer_nodes)
-    wf["S1_ltxv_cond"] = {"class_type": "LTXVConditioning", "inputs": {"positive": ["S1_relay", 1], "negative": ["S1_neg_enc", 0], "frame_rate": float(safe_fps)}}
 
     safe_msr_strength = min(1.0, max(0.0, float(msr_strength)))
 
@@ -596,20 +445,20 @@ def build_msr_workflow(
     wf["S1_msr_guide"] = {"class_type": "ComfyUILTX25MSRMultiReferenceGuide", "inputs": msr_s1}
 
     wf.update({
-        "S1_dual_guider": {"class_type": "LTXVDualCFGGuider",    "inputs": {"model": ["S1_relay", 0], "positive": ["S1_msr_guide", 0], "negative": ["S1_msr_guide", 1], "video_cfg": float(video_cfg), "audio_cfg": float(audio_cfg)}},
+        # Workflow gốc: Stage 1 dùng CFGGuider đơn giản (cfg=1.0), KHÔNG phải LTXVDualCFGGuider
+        # Chỉ Stage 2 mới dùng LTXVDualCFGGuider (có video_cfg + audio_cfg riêng)
+        "S1_guider":      {"class_type": "CFGGuider",           "inputs": {"model": ["S1_relay", 0], "positive": ["S1_msr_guide", 0], "negative": ["S1_msr_guide", 1], "cfg": 1.0}},
         "S1_noise":       {"class_type": "RandomNoise",          "inputs": {"noise_seed": int(seed)}},
         "S1_sampler_sel": {"class_type": "KSamplerSelect",       "inputs": {"sampler_name": "euler_ancestral"}},
         "S1_sigmas":      {"class_type": "ManualSigmas",         "inputs": {"sigmas": SIGMAS_PASS1}},
         "S1_concat_av":   {"class_type": "LTXVConcatAVLatent",   "inputs": {"video_latent": ["S1_msr_guide", 2], "audio_latent": ["S1_empty_aud", 0]}},
-        "S1_sample":      {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["S1_noise", 0], "guider": ["S1_dual_guider", 0], "sampler": ["S1_sampler_sel", 0], "sigmas": ["S1_sigmas", 0], "latent_image": ["S1_concat_av", 0]}},
+        "S1_sample":      {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["S1_noise", 0], "guider": ["S1_guider", 0], "sampler": ["S1_sampler_sel", 0], "sigmas": ["S1_sigmas", 0], "latent_image": ["S1_concat_av", 0]}},
         "S1_sep_av":      {"class_type": "LTXVSeparateAVLatent",  "inputs": {"av_latent": ["S1_sample", 0]}},
         "S1_crop_guides": {"class_type": "LTXVCropGuides",       "inputs": {"positive": ["S1_msr_guide", 0], "negative": ["S1_msr_guide", 1], "latent": ["S1_sep_av", 0]}},
-        # (SỬA — VRAM) VAEDecode thường -> VAEDecodeTiled: giảm đỉnh bộ nhớ
-        # hoạt động khi decode toàn bộ total_frames cùng lúc ở nửa độ phân giải.
-        "S1_vae_decode":  {"class_type": "VAEDecodeTiled",       "inputs": {"samples": ["S1_crop_guides", 2], "vae": ["S1_vvae", 0], "tile_size": 256, "overlap": 32, "temporal_size": 32, "temporal_overlap": 8}},
+        "S1_vae_decode":  {"class_type": "VAEDecode",             "inputs": {"samples": ["S1_crop_guides", 2], "vae": ["S1_vvae", 0]}},
         "S1_aud_decode":  {"class_type": "LTXVAudioVAEDecode",   "inputs": {"samples": ["S1_sep_av", 1], "audio_vae": ["S1_avae", 0]}},
         "S1_create_vid":  {"class_type": "CreateVideo",           "inputs": {"images": ["S1_vae_decode", 0], "audio": ["S1_aud_decode", 0], "fps": float(safe_fps)}},
-        "S1_save":        {"class_type": "SaveVideo",             "inputs": {"video": ["S1_create_vid", 0], "filename_prefix": "LTX25_MSR_Stage1", "format": "auto", "codec": "auto"}},
+        "S1_save":        {"class_type": "SaveVideo",             "inputs": {"video": ["S1_create_vid", 0], "filename_prefix": "output/LTX25_MSR_Stage1", "format": "auto", "codec": "auto"}},
     })
 
     if not run_stage2:
@@ -626,11 +475,7 @@ def build_msr_workflow(
                 "clip":            ["S1_clip", 0],
                 "latent":          ["S2_upsampler", 0],
                 "global_prompt":   prompt_relay_desc or "",
-                # Dùng lại đúng prompt (đã enhance nếu prompt_enhance=True)
-                # của Stage 1, KHÔNG chạy lại enhancer lần 2 — giữ mô tả
-                # chuyển động nhất quán giữa 2 pass và tiết kiệm 1 lượt
-                # inference của model Gemma.
-                "local_prompts":   local_prompts_value,
+                "local_prompts":   prompt_main,
                 "segment_lengths": "",
                 "epsilon":         0.001,
             },
@@ -638,7 +483,8 @@ def build_msr_workflow(
     })
 
     stage2_seed = (int(seed) + 1000) if seed is not None else 42
-    stage2_msr_strength = min(0.6, safe_msr_strength * 0.8)
+    # Stage 2 giữ nguyên msr_strength như Stage 1 — giảm mạnh là nguyên nhân nhân vật bị đổi ở bước upscale
+    stage2_msr_strength = safe_msr_strength
 
     msr_s2 = {
         "positive": ["S2_relay", 1], "negative": ["S1_neg_enc", 0],
@@ -653,7 +499,7 @@ def build_msr_workflow(
     wf["S2_msr_guide"] = {"class_type": "ComfyUILTX25MSRMultiReferenceGuide", "inputs": msr_s2}
 
     wf.update({
-        "S2_ltxv_cond":   {"class_type": "LTXVConditioning",      "inputs": {"positive": ["S2_msr_guide", 0], "negative": ["S2_msr_guide", 1], "frame_rate": float(safe_fps)}},
+        "S2_ltxv_cond":   {"class_type": "LTXVConditioning",      "inputs": {"positive": ["S2_msr_guide", 0], "negative": ["S2_msr_guide", 1], "frame_rate": ["S1_fps", 0]}},
         "S2_concat_av":   {"class_type": "LTXVConcatAVLatent",   "inputs": {"video_latent": ["S2_msr_guide", 2], "audio_latent": ["S1_sep_av", 1]}},
         "S2_dual_guider": {"class_type": "LTXVDualCFGGuider",    "inputs": {"model": ["S2_relay", 0], "positive": ["S2_ltxv_cond", 0], "negative": ["S2_ltxv_cond", 1], "video_cfg": float(video_cfg), "audio_cfg": float(audio_cfg)}},
         "S2_noise":       {"class_type": "RandomNoise",           "inputs": {"noise_seed": stage2_seed}},
@@ -665,7 +511,7 @@ def build_msr_workflow(
         "S2_vae_tiled":   {"class_type": "VAEDecodeTiled",        "inputs": {"samples": ["S2_crop_guides", 2], "vae": ["S1_vvae", 0], "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 16}},
         "S2_aud_decode":  {"class_type": "LTXVAudioVAEDecode",   "inputs": {"samples": ["S2_sep_av", 1], "audio_vae": ["S1_avae", 0]}},
         "S2_create_vid":  {"class_type": "CreateVideo",           "inputs": {"images": ["S2_vae_tiled", 0], "audio": ["S2_aud_decode", 0], "fps": float(safe_fps)}},
-        "S2_save":        {"class_type": "SaveVideo",             "inputs": {"video": ["S2_create_vid", 0], "filename_prefix": "LTX25_MSR_DualStage", "format": "auto", "codec": "auto"}},
+        "S2_save":        {"class_type": "SaveVideo",             "inputs": {"video": ["S2_create_vid", 0], "filename_prefix": "output/LTX25_MSR_DualStage", "format": "auto", "codec": "auto"}},
     })
 
     return wf
@@ -680,9 +526,7 @@ def generate_msr_gradio(
     aspect_ratio, v_length, v_fps, v_seed, num_segments, fixed_seed,
     video_cfg, msr_lora_name, msr_lora_strength, msr_strength,
     reference_frames, use_tiled_encode,
-    prompt_enhance,
-    run_stage2,
-    vram_mode_ui, reserve_vram_ui, free_mem_between_scenes, restart_every_n,
+    run_stage2, low_vram,
 ):
     if not pic1_path:
         yield None, None, "⚠️ Dạ anh vui lòng tải ít nhất ảnh Pic 1 (bắt buộc) giúp em nha!"; return
@@ -696,7 +540,7 @@ def generate_msr_gradio(
 
     yield None, None, "🔄 Đang kiểm tra / khởi động ComfyUI server..."
     try:
-        ensure_server(vram_mode_ui, reserve_vram_ui)
+        ensure_server(low_vram)
     except Exception as e:
         yield None, None, f"❌ {e}"; return
 
@@ -729,31 +573,16 @@ def generate_msr_gradio(
     total_scenes = len(scene_prompts)
     total_seconds = total_scenes * int(v_length)
     stage_note = "Stage 1 + Stage 2 (upscale x2)" if run_stage2 else "Stage 1 only (preview)"
-    enhance_note = "✨ Prompt Enhancer: BẬT" if prompt_enhance else "Prompt Enhancer: tắt"
-    resolved_mode = _VRAM_CONFIG_DEFAULT["mode"] if vram_mode_ui == "auto" else vram_mode_ui
-    vram_note = f"🧠 VRAM: --{resolved_mode} (reserve {reserve_vram_ui}GB)"
 
     yield None, None, (
         f"✅ Server sẵn sàng. Bắt đầu tạo chuỗi {total_scenes} phân cảnh MSR (tổng {total_seconds}s)...\n"
-        f"📸 Ảnh tham khảo: {len(loaded)} slot · Chế độ: {stage_note} · {enhance_note} · {vram_note}\n"
-        f"Base Seed: {base_seed} · Video CFG: {video_cfg}"
+        f"📸 Ảnh tham khảo: {len(loaded)} slot · Chế độ: {stage_note} · Base Seed: {base_seed} · Video CFG: {video_cfg}"
     )
 
     generated_videos = []
     for i, p in enumerate(scene_prompts):
         label = f"phân cảnh {i + 1}/{total_scenes}"
         seed_i = base_seed if fixed_seed else (base_seed + i)
-
-        # (MỚI) Restart server định kỳ trong chuỗi dài để dọn sạch VRAM /
-        # tránh tích luỹ phân mảnh qua nhiều job liên tiếp. Chỉ áp dụng
-        # TRƯỚC khi bắt đầu 1 cảnh mới (không cắt ngang cảnh đang chạy).
-        if restart_every_n and int(restart_every_n) > 0 and i > 0 and i % int(restart_every_n) == 0:
-            yield generated_videos, None, f"🔄 Restart định kỳ ComfyUI server trước {label} (mỗi {int(restart_every_n)} cảnh)..."
-            force_restart_server()
-            try:
-                ensure_server(vram_mode_ui, reserve_vram_ui)
-            except Exception as e:
-                yield generated_videos, None, f"❌ {e}"; return
 
         yield generated_videos, None, (
             f"🔄 Đang quay {label} [{stage_note}]... (Seed: {seed_i})\n"
@@ -780,38 +609,53 @@ def generate_msr_gradio(
             msr_strength      = msr_strength,
             reference_frames  = str(reference_frames),
             use_tiled_encode  = bool(use_tiled_encode),
-            prompt_enhance    = bool(prompt_enhance),
             run_stage2        = bool(run_stage2),
         )
 
-        job_t0 = time.time()
+        # Timeout động: Stage 1 ~3 phút/giây video, Stage 2 thêm gấp đôi nữa
+        # Tối thiểu 10 phút, tối đa 3 giờ
+        base_timeout = max(600, int(v_length) * 180)
+        scene_timeout = base_timeout * 2 if run_stage2 else base_timeout
+
+        # Snapshot danh sách file trước khi submit để detect Stage 1 output mới
+        snap_before = set(glob.glob(f"{OUTPUT_DIR}**/*.mp4", recursive=True))
+
+        stage1_fallback = None
         try:
-            res_video = submit_and_wait(wf, scene_label=label)
-        except Exception as e:
-            yield generated_videos, None, f"❌ {e}"; return
+            submit_and_wait(wf, scene_label=label, max_wait_seconds=scene_timeout)
+        except RuntimeError as e:
+            err_str = str(e)
+            # Nếu là timeout và Stage 1 đã ghi file → dùng Stage 1 làm fallback
+            if "Timeout" in err_str and run_stage2:
+                snap_after = set(glob.glob(f"{OUTPUT_DIR}**/*.mp4", recursive=True))
+                new_files = sorted(snap_after - snap_before, key=os.path.getmtime)
+                stage1_candidates = [f for f in new_files if "Stage1" in f]
+                if stage1_candidates:
+                    stage1_fallback = stage1_candidates[-1]
+                    yield generated_videos, None, (
+                        f"⚠️ Stage 2 timeout ({scene_timeout // 60} phút) ở {label} — "
+                        f"dùng video Stage 1 làm thay thế: {os.path.basename(stage1_fallback)}"
+                    )
+                else:
+                    yield generated_videos, None, f"❌ {err_str}"; return
+            else:
+                yield generated_videos, None, f"❌ {err_str}"; return
 
-        if isinstance(res_video, str) and os.path.exists(res_video) and not res_video.isdigit():
-            latest_video = res_video
+        # Dùng Stage 1 fallback nếu Stage 2 timeout, ngược lại tìm video mới nhất
+        if stage1_fallback:
+            latest_video = stage1_fallback
         else:
-            latest_video = find_latest_video(min_mtime=job_t0)
+            latest_video = find_latest_video()
+        if not latest_video:
+            yield generated_videos, None, f"⚠️ Không tìm thấy file video ở {label}!"; return
 
-        if not latest_video or not os.path.exists(latest_video):
-            yield generated_videos, None, (
-                f"⚠️ Không tìm thấy file video ở {label}!\n"
-                f"Kiểm tra lại log ComfyUI server trong terminal để xem chi tiết lỗi."
-            )
-            return
+        # Tự động cắt reference frames dư thừa ở đầu video
+        # (xảy ra khi LTXVCropGuides không hoạt động đúng)
+        latest_video = trim_ref_frames(latest_video, target_duration_s=int(v_length), fps=v_fps)
 
+        fallback_note = " ⚠️[Stage1 fallback]" if stage1_fallback else ""
         generated_videos.append(latest_video)
-
-        # (MỚI) Giải phóng VRAM giữa mỗi phân cảnh — quan trọng cho chuỗi
-        # dài (vd 10 cảnh) để tránh VRAM tích tụ/phân mảnh dần theo thời gian.
-        freed_note = ""
-        if free_mem_between_scenes:
-            ok = free_comfy_memory()
-            freed_note = " · 🧹 đã gọi /free" if ok else " · ⚠️ /free không khả dụng (bỏ qua)"
-
-        yield generated_videos, None, f"🔔 [DING] ✅ Xong {label} ({i + 1}/{total_scenes}){freed_note}!"
+        yield generated_videos, None, f"🔔 [DING] ✅ Xong {label} ({i + 1}/{total_scenes})!{fallback_note}"
 
     # Ghép nối các phân cảnh thành 1 video dài hoàn chỉnh
     if len(generated_videos) > 1:
@@ -877,15 +721,11 @@ function(){
 }
 """
 
-# Đọc phiên bản 2 custom node bên thứ ba (ghi ra bởi Cell 1) để hiển thị
-# công khai trên header, cùng cấu hình VRAM đang dùng.
-_msr_node_v, _relay_node_v = read_node_versions()
-_vram_cfg = read_vram_config()
-
-custom_theme = gr.themes.Soft(primary_hue="violet", secondary_hue="purple", neutral_hue="slate")
-
 with gr.Blocks(
+    theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple", neutral_hue="slate"),
     title="LTX-2.5 MSR Studio",
+    css=custom_css,
+    js=notification_js,
     fill_width=True,
 ) as demo:
 
@@ -893,21 +733,12 @@ with gr.Blocks(
         with gr.Row():
             with gr.Column(scale=4):
                 gr.Markdown(
-                    f"""
+                    """
                     # 🎬 LTX-2.5 MSR Studio (Tạo Video Dài Tự Động)
                     Multi-Subject Reference — Tạo phim dài nhiều phân cảnh từ ảnh tham khảo nhân vật & bối cảnh
 
                     <div style="margin-top:4px; opacity:0.9; font-size:0.9rem;">
                     ⚡ LTX-2.5 · 🎭 Tối đa 4 nhân vật + 1 bối cảnh · 🎞️ Tự động render chuỗi kịch bản & ghép nối hoàn chỉnh bằng ffmpeg
-                    </div>
-                    <div style="margin-top:6px; opacity:0.75; font-size:0.78rem;">
-                    🔧 Custom node bên thứ ba (chưa phải node lõi ComfyUI/Lightricks) đang chạy:
-                    ComfyUI-LTX2.5-MSR@{_msr_node_v} · ComfyUI-PromptRelay@{_relay_node_v}
-                    — ghim/cập nhật ở Cell 1 (biến MSR_NODE_PIN / PROMPT_RELAY_PIN).
-                    </div>
-                    <div style="margin-top:4px; opacity:0.75; font-size:0.78rem;">
-                    🧠 VRAM mặc định từ Cell 1: --{_vram_cfg['mode']} cho GPU {_vram_cfg['gpu_vram_gb']}GB
-                    (reserve {_vram_cfg['reserve_vram_gb']}GB) — cờ THẬT, khác --cache-none của bản trước.
                     </div>
                     """
                 )
@@ -941,18 +772,23 @@ with gr.Blocks(
                 gr.Markdown("### 📝 Kịch bản & Prompt")
                 gr.Markdown(
                     "<div class='info-box'>"
-                    "① <b>Mô tả nhân vật</b>: mô tả ngoại hình từng nhân vật (<code>Image 1:... Image 2:...</code>)<br>"
-                    "② <b>Kịch bản phim</b>: có thể nhập nhiều phân cảnh (mỗi cảnh cách nhau 1 dòng trống ~ 2 lần Enter). "
-                    "Hệ thống sẽ tự động quay lần lượt từng cảnh 10s rồi tự ghép nối thành phim dài 30s, 60s!"
+                    "① <b>Mô tả nhân vật</b>: dùng <code>Image 1:... Image 2:...</code> — "
+                    "phải khớp <b>chính xác</b> với Pic 1, Pic 2 trong ảnh tham khảo bên trên. "
+                    "Mô tả càng chi tiết (màu lông, trang phục, đặc điểm) càng giữ được nhân vật đúng.<br>"
+                    "② <b>Kịch bản phim</b>: mỗi phân cảnh cách nhau 1 dòng trống. "
+                    "Hệ thống render từng cảnh rồi ghép nối thành phim dài.<br>"
+                    "<span style='color:#e53935'>⚠️ <b>Hội thoại / SPEECH</b>: mô tả lời nói <b>ở đầu câu prompt</b>, "
+                    "KHÔNG dùng timestamp (At 00:08...) vì model sẽ đẩy speech về cuối video. "
+                    "Ví dụ đúng: <i>\"Figure 1 immediately says 'Hello!' while walking forward...\"</i></span>"
                     "</div>"
                 )
                 msr_relay_desc = gr.Textbox(
-                    label="① Mô tả nhân vật (character_description)",
+                    label="① Mô tả nhân vật — phải khớp với Pic 1/2/3/4 bên trên",
                     lines=4,
                     placeholder=(
-                        "Image 1: A real chubby orange tabby cat with fluffy ginger fur, wearing a miniature chef hat...\n\n"
-                        "Image 2: A real cute Corgi puppy wearing a red bandana...\n\n"
-                        "Image 3: A real curious raccoon holding a small wooden spoon..."
+                        "Image 1: A chubby orange tabby cat with fluffy ginger fur, wearing a miniature chef hat and white apron.\n\n"
+                        "Image 2: A cute Corgi puppy with golden fur, wearing a red bandana around its neck.\n\n"
+                        "Image 3: A curious raccoon with grey striped tail, holding a small wooden spoon."
                     ),
                 )
                 scene_count_display = gr.Markdown("🔹 **Số phân cảnh nhận diện được:** 0", elem_classes="scene-counter")
@@ -960,9 +796,12 @@ with gr.Blocks(
                     label="② Kịch bản / Prompt chính (mỗi phân cảnh cách nhau 1 dòng trống)",
                     lines=6,
                     placeholder=(
-                        "[Shot 1] The orange cat gestures with a wooden spoon atop the counter...\n\n"
-                        "[Shot 2] The refrigerator door opens, the corgi puppy slips on the floor and slides...\n\n"
-                        "[Shot 3] All animals feast on cake, the light clicks on and they freeze staring at camera..."
+                        "Figure 1 (orange cat chef) immediately waves the wooden spoon and shouts 'Dinner is ready!', "
+                        "camera slowly pushes in as steam rises from the pot on the counter.\n\n"
+                        "Figure 2 (corgi puppy) immediately slides across the kitchen floor excitedly toward the food bowl, "
+                        "tail wagging rapidly, camera follows from behind.\n\n"
+                        "All characters immediately freeze and stare at camera as the kitchen light flicks on, "
+                        "wide shot, everyone caught in the act around the feast."
                     ),
                 )
                 msr_neg = gr.Textbox(
@@ -980,7 +819,7 @@ with gr.Blocks(
                     info="Stage 1 chạy ½ res, Stage 2 upscale x2 về full res",
                 )
                 with gr.Row():
-                    length_msr = gr.Slider(label="⏱️ Thời lượng MỖI cảnh (giây)", minimum=1, maximum=10, step=1, value=10)
+                    length_msr = gr.Slider(label="⏱️ Thời lượng MỖI cảnh (giây)", minimum=1, maximum=20, step=1, value=10)
                     fps_msr    = gr.Slider(label="🎞️ FPS", minimum=8, maximum=120, step=8, value=24)
 
                 with gr.Row():
@@ -994,81 +833,32 @@ with gr.Blocks(
 
                 gr.Markdown("**🧬 MSR LoRA**")
                 with gr.Row():
-                    _msr_choices = list_msr_loras()
-                    _msr_default = _msr_choices[0] if _msr_choices else MSR_LORA_REL_PATH
                     msr_lora_dd = gr.Dropdown(
-                        label="MSR LoRA",
-                        choices=_msr_choices,
-                        value=_msr_default,
-                        allow_custom_value=True,
-                        scale=3,
-                    )
+                        label="MSR LoRA", choices=list_msr_loras(), value=MSR_LORA_FILENAME, scale=3)
                     msr_lora_str_sl = gr.Slider(
-                        label="LoRA strength", minimum=0.0, maximum=2.0, step=0.05, value=0.85, scale=2,
-                        info="0.85 = cân bằng hoàn hảo giữa nhận diện nhân vật & độ tự do chuyển động")
+                        label="LoRA strength", minimum=0.0, maximum=2.0, step=0.05, value=1.0, scale=2,
+                        info="1.0 = khuyến nghị để giữ nhân vật đúng. Giảm xuống nếu nhân vật bị cứng/artifact")
                 msr_refresh_btn = gr.Button("🔄 Refresh MSR LoRA", size="sm")
-                msr_refresh_btn.click(
-                    fn=lambda: gr.update(
-                        choices=list_msr_loras(),
-                        value=list_msr_loras()[0] if list_msr_loras() else MSR_LORA_REL_PATH,
-                    ),
-                    outputs=[msr_lora_dd],
-                )
+                msr_refresh_btn.click(fn=lambda: gr.update(choices=list_msr_loras()), outputs=[msr_lora_dd])
 
                 gr.Markdown("**🎯 Cài đặt MSR Guide & Độ Tuân Thủ Prompt**")
                 with gr.Row():
                     msr_video_cfg = gr.Slider(
-                        label="🎯 Video CFG (Độ tuân thủ Prompt)", minimum=1.0, maximum=3.5, step=0.1, value=1.5,
-                        info="Khuyến nghị 1.5 – 2.0 để AI bám sát hành động trong kịch bản", scale=1)
+                        label="🎯 Video CFG (Độ tuân thủ Prompt)", minimum=1.0, maximum=3.5, step=0.1, value=2.5,
+                        info="2.5 – 3.0 để AI bám sát prompt & hội thoại. Giảm nếu video bị artifact", scale=1)
                     msr_guide_str_sl = gr.Slider(
-                        label="Reference strength", minimum=0.0, maximum=1.0, step=0.05, value=0.7,
-                        info="Độ bám ảnh tham khảo — 0.7 chuẩn nhất (giữ nhân vật & chuyển động mượt)", scale=1)
+                        label="Reference strength", minimum=0.0, maximum=1.0, step=0.05, value=0.85,
+                        info="0.85 = giữ nhân vật chặt hơn. Giảm nếu chuyển động bị cứng", scale=1)
                 with gr.Row():
                     msr_ref_frames = gr.Radio(
                         label="Reference frames", choices=["25", "33"], value="33",
                         info="33 = mặc định MSR chính thức")
-                    msr_tiled = gr.Checkbox(label="Tiled VAE encode (khuyến nghị BẬT chống tràn VRAM)", value=True)
+                    msr_tiled = gr.Checkbox(label="Tiled VAE encode", value=False)
 
                 gr.Markdown("**⚙️ Pipeline**")
                 with gr.Row():
-                    msr_stage2   = gr.Checkbox(label="✅ Chạy Stage 2 (upscale x2 + refine - BẬT để nét căng full HD, TẮT để render siêu tốc ~60s/cảnh)", value=True)
-                with gr.Row():
-                    msr_prompt_enhance = gr.Checkbox(
-                        label="✨ Prompt Enhancer",
-                        value=False,
-                        info="Dùng model Gemma nhẹ (gemma4_e2b_it_bf16) tự mở rộng prompt ngắn thành mô tả điện ảnh chi tiết hơn trước khi render.",
-                    )
-
-                gr.Markdown("**🧠 Quản lý VRAM & Tốc độ Render**")
-                gr.Markdown(
-                    "<div class='info-box'>"
-                    "Với GPU 22GB (A10G, RTX 3090/4090), hãy để chế độ VRAM là <b>normal</b> (hoặc auto) để AI chạy hoàn toàn trên GPU ở tốc độ nhanh nhất (~60-90s/cảnh). "
-                    "Nếu GPU của bạn nhỏ hơn (≤16GB) mới cần chọn <b>lowvram</b>."
-                    "</div>"
-                )
-                with gr.Row():
-                    msr_vram_mode = gr.Radio(
-                        label="Chế độ VRAM",
-                        choices=["auto", "normal", "lowvram", "novram"],
-                        value="auto",
-                        info=f"'auto' = theo Cell 1 (hiện tại: --{_vram_cfg['mode']}).",
-                    )
-                    msr_reserve_vram = gr.Slider(
-                        label="Reserve VRAM (GB)", minimum=0.0, maximum=6.0, step=0.5,
-                        value=float(_vram_cfg.get("reserve_vram_gb", 1.5)),
-                        info="Chừa bộ nhớ đệm cho hệ thống ngoài model.",
-                    )
-                with gr.Row():
-                    msr_free_between = gr.Checkbox(
-                        label="🧹 Giải phóng VRAM giữa mỗi phân cảnh (khuyến nghị BẬT cho ≥5 cảnh)",
-                        value=True,
-                        info="Gọi API /free của ComfyUI sau mỗi cảnh để tránh VRAM tích tụ/phân mảnh dần.",
-                    )
-                    msr_restart_every = gr.Slider(
-                        label="🔄 Restart server mỗi N cảnh (0 = tắt)",
-                        minimum=0, maximum=10, step=1, value=2,
-                        info="Khởi động lại ComfyUI định kỳ mỗi 2 cảnh (chỉ mất ~3s) để dọn sạch 100% rác VRAM & RAM khi quay chuỗi 10 cảnh.",
-                    )
+                    msr_stage2   = gr.Checkbox(label="✅ Chạy Stage 2 (upscale x2 + refine)", value=True)
+                    msr_low_vram = gr.Checkbox(label="🧊 Low VRAM Mode", value=True)
 
         # --- CỘT PHẢI: OUTPUTS ---
         with gr.Column(scale=5):
@@ -1083,13 +873,11 @@ with gr.Blocks(
 
             gr.Markdown(
                 "<div class='info-box'>"
-                "<b>💡 Hướng dẫn tạo phim 30s–60s / chuỗi 10 cảnh:</b><br>"
-                "• Bạn dán toàn bộ các phân đoạn trong kịch bản vào ô prompt (cách nhau 2 lần Enter).<br>"
-                "• Nhấn <b>Bắt Đầu Tạo Phim MSR</b>: hệ thống tự động chạy lần lượt từng cảnh rồi tự ghép "
-                "lại thành 1 video hoàn chỉnh!<br>"
-                "• Với GPU 22GB và ≥5 cảnh: giữ 'Chế độ VRAM' = lowvram (hoặc auto nếu Cell 1 đã set 22GB), "
-                "bật 'Giải phóng VRAM giữa mỗi phân cảnh', và đặt 'Restart mỗi N cảnh' ~5 để chạy ổn định "
-                "cho 10 cảnh liên tiếp — đổi lại tốc độ sẽ chậm hơn GPU 40GB+."
+                "<b>💡 Hướng dẫn tạo phim 30s–60s:</b><br>"
+                "• Bạn dán toàn bộ 3 phân đoạn trong kịch bản vào ô prompt (cách nhau 2 lần Enter).<br>"
+                "• Nhấn <b>Bắt Đầu Tạo Phim MSR</b>: hệ thống sẽ tự động chạy Shot 1 (10s) → Shot 2 (10s) → Shot 3 (10s) "
+                "rồi tự ghép lại thành 1 video 30s hoàn chỉnh!<br>"
+                "• Tất cả các cảnh đều đồng bộ giữ nguyên đúng nhân vật từ các ảnh tham khảo."
                 "</div>"
             )
 
@@ -1103,9 +891,7 @@ with gr.Blocks(
             ratio_msr, length_msr, fps_msr, seed_msr, num_segments_msr, fixed_seed_msr,
             msr_video_cfg, msr_lora_dd, msr_lora_str_sl, msr_guide_str_sl,
             msr_ref_frames, msr_tiled,
-            msr_prompt_enhance,
-            msr_stage2,
-            msr_vram_mode, msr_reserve_vram, msr_free_between, msr_restart_every,
+            msr_stage2, msr_low_vram,
         ],
         outputs=[gallery_msr, video_out_msr, msr_status],
     )
@@ -1115,14 +901,4 @@ with gr.Blocks(
     )
 
 demo.queue()
-try:
-    demo.launch(
-        theme=custom_theme,
-        css=custom_css,
-        js=notification_js,
-        share=True,
-        inline=False,
-        debug=True,
-    )
-except TypeError:
-    demo.launch(share=True, inline=False, debug=True)
+demo.launch(share=True, inline=False, debug=True)

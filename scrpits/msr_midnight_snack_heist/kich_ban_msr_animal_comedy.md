@@ -2,8 +2,99 @@
 
 - **Thể loại:** Hài hước, siêu dễ thương (Cute & Comedy Animal Animation), chuẩn hoạt hình 3D Pixar/Disney
 - **Định dạng khung hình:** **9:16 Khung dọc (Vertical Video)** — Tối ưu cho TikTok, Facebook Reels, YouTube Shorts
-- **Thời lượng:** 30 giây (3 phân đoạn x 10s hoặc chạy liên tục)
-- **Tương thích:** Tối ưu chuẩn cho `ltx2_5_msr.py` (cơ chế PromptRelayEncode + MSR Multi-Reference Guide)
+- **Thời lượng:** 30 giây (3 phân đoạn × 10s, tự ghép nối)
+- **Tương thích:** Tối ưu chuẩn cho `ltx2_5_msr.py` — áp dụng 3 fix: speech ở đầu prompt, bỏ timestamp, character desc khớp ảnh
+
+---
+
+## 📌 PHẦN 1: MÔ TẢ NHÂN VẬT & BỐI CẢNH (`character_description`)
+> *Dán toàn bộ đoạn tiếng Anh bên dưới vào ô **① Mô tả nhân vật — phải khớp với Pic 1/2/3/4 bên trên***
+>
+> ⚠️ **Quy tắc bắt buộc:** `Image 1` mô tả chính xác nhân vật trong **Pic 1**, `Image 2` mô tả **Pic 2**, v.v. Mô tả càng chi tiết (màu lông, trang phục, đặc điểm) → AI giữ nhân vật càng chính xác.
+
+```text
+Image 1: A chubby orange tabby cat with thick fluffy ginger fur, round amber eyes, white whiskers, pink nose, wearing a miniature white chef hat tilted on its head and a tiny white apron. Pixar-style 3D cartoon character, photorealistic render quality.
+
+Image 2: A tri-color Corgi puppy with large perky ears, short stubby legs, golden and white fluffy fur, happy smiling face with tongue out, wearing a tiny red bandana tied around its neck. Pixar-style 3D cartoon character, photorealistic render quality.
+
+Image 3: A chubby raccoon with natural black eye mask markings, grey fur with dark stripes on bushy tail, delicate dexterous paws, holding a small wooden spoon. Pixar-style 3D cartoon character, photorealistic render quality.
+
+Image 4: A tiny fluffy golden Syrian hamster with puffed-up round cheeks, shiny black bead eyes, soft golden fur, standing on its hind legs looking alert. Pixar-style 3D cartoon character, photorealistic render quality.
+
+Image 5: Scene, vertical 9:16 composition, cozy home kitchen at night, soft moonlight streaming through window, tall stainless steel refrigerator with door slightly ajar and warm interior light spilling out, cinematic warm lighting, 4k.
+```
+
+---
+
+## 📌 PHẦN 2: PROMPT CHÍNH — HÀNH ĐỘNG & KỊCH BẢN 9:16 (`prompt_main`)
+> *Dán toàn bộ 3 phân đoạn bên dưới vào ô **② Kịch bản / Prompt chính**. Mỗi phân cảnh cách nhau 1 dòng trống.*
+>
+> ✅ **Fix đã áp dụng:**
+> - **Speech ở đầu câu** — lời thoại xuất hiện ngay frame đầu, KHÔNG dùng `At 00:XX.XXX`
+> - **Từ "immediately"** — báo hiệu hành động xảy ra tức thì ngay khi video bắt đầu
+> - **Figure rõ ràng** — chỉ đích danh `Figure 1`, `Figure 2` khớp với `Image 1`, `Image 2` trong mô tả nhân vật
+
+```text
+Figure 1 (orange tabby cat chef) immediately taps a wooden spoon on the counter and meows loudly saying 'Nghe đây! Tối nay đội mình đột kích tủ lạnh. Mục tiêu: bánh phô mai, tầng hai, góc trái. Không để lại bằng chứng. Phát!' with an animated open mouth and commanding eyes. In the lower background, Figure 2 (corgi puppy) and Figure 3 (raccoon) immediately nod and begin sneaking forward across the kitchen floor toward the refrigerator. Continuous vertical locked shot, cozy midnight kitchen, no camera cut, consistent character appearance throughout.
+
+Figure 2 (corgi puppy with red bandana) immediately shouts 'Ôi TRỜI ƠI trơn vậy trời— AHHHH! Ai cứu tui vớiiiiii mà!!!' with mouth wide open as it slides forward on the kitchen tile floor after slipping on a butter wrapper. Figure 3 (raccoon) holds a giant cheesecake slice near the open refrigerator in the background. Figure 2 slides rapidly toward the camera and crashes into a stack of pudding cups at the bottom frame. Dynamic vertical tracking shot, continuous take, no cuts, consistent character fur and bandana throughout.
+
+Figure 1 (orange tabby cat chef) immediately looks up into the camera with wide guilty blinking amber eyes and says 'Ơ... Sen đi ngủ chưa ạ? Tụi này đang... kiểm tra hạn sử dụng bánh thôi ạ. Vì sức khoẻ của Sen đó ạ.' while sitting next to a half-eaten cheesecake on the kitchen floor, mouth still smeared with cream. Figure 2 (corgi puppy) freezes beside Figure 1 with pudding on its nose. Overhead kitchen light suddenly blazes on bright white. Locked continuous vertical high-angle shot, consistent character appearance, no scene cuts.
+```
+
+---
+
+## 🎙️ BẢNG CHI TIẾT LỜI THOẠI [SPEECH] TIẾNG VIỆT (DÙNG ĐỂ THU ÂM / LỒNG TIẾNG CAPCUT / TTS)
+> 🎯 **Quy tắc 1 Speaker / Shot:** Mỗi shot 10s chỉ có **1 nhân vật nói duy nhất** để âm thanh, khẩu hình và hình ảnh hoàn toàn ăn khớp.
+>
+> ✅ **Fix SPEECH timing:** Lời thoại xuất hiện **ngay frame đầu** nhờ đặt "immediately says/shouts" ở đầu prompt — không còn bị đẩy về cuối video.
+
+| Shot / Phân đoạn | Nhân vật phát ngôn | Giọng điệu & Hành động | Lời thoại [SPEECH] |
+| :--- | :--- | :--- | :--- |
+| **Shot 1**<br>*(10 giây)* | 🐱 **Figure 1 (Mèo Đầu Bếp)** | Gõ thìa chỉ huy — nghiêm như sếp tổng<br>Figure 2 & 3 gật đầu bò đi ngay | *(SFX: Cộc cộc cộc)*<br>🐱 *"Nghe đây! Tối nay đội mình đột kích tủ lạnh. Mục tiêu: bánh phô mai, tầng hai, góc trái. Không để lại bằng chứng. Phát!"*<br>*(SFX: Tiếng chân rón rén)* |
+| **Shot 2**<br>*(10 giây)* | 🐶 **Figure 2 (Chó Corgi)** | Trượt ngay từ đầu — hét như bị bắt cóc<br>Lao thẳng vào camera như tàu hoả | *(SFX: Kẽo kẹt mở tủ lạnh)*<br>🐶 *"Ôi TRỜI ƠI trơn vậy trời— AHHHH! Ai cứu tui vớiiiiii mà!!!"*<br>*(SFX: Tiếng trượt dài & Xoảng xoảng BỤP!)* |
+| **Shot 3**<br>*(10 giây)* | 🐱 **Figure 1 (Mèo Đầu Bếp)** | Nhìn thẳng camera — mặt dày 100%<br>Mồm vẫn dính kem, phân trần không chớp mắt | *(SFX: Chẹp chẹp nhai ngấu nghiến)*<br>*(SFX: Tách — Đèn bật trắng trưng)*<br>🐱 *"Ơ... Sen đi ngủ chưa ạ? Tụi này đang... kiểm tra hạn sử dụng bánh thôi ạ. Vì sức khoẻ của Sen đó ạ."*<br>*(SFX: Tiếng dế kêu / quạ kêu)* |
+
+---
+
+## 🚫 PHẦN 3: PROMPT PHỦ ĐỊNH (`negative_prompt`)
+> *Dán vào ô **Negative Prompt*** (đã cập nhật theo fix character consistency)
+
+```text
+blurry, oversaturated, pixelated, low resolution, grainy, distorted, noise, compression artifacts, glitches, watermark, text, logo, subtitles, static frame, frozen image, standing still, lack of motion, deformed limbs, extra paws, duplicate limbs, distorted face, character switching, sudden character change, wrong character, inconsistent character identity, different person, different animal, character replacement, morphing face, mid-shot camera cut, sudden transition, ignored prompt
+```
+
+---
+
+## 💡 HƯỚNG DẪN GÁN ẢNH THAM KHẢO VÀO CÁC Ô TRÊN GRADIO
+
+| Ô Upload trong UI | Nhân vật tương ứng (`Image X`) | Gợi ý hình ảnh tải lên |
+| :--- | :--- | :--- |
+| **🎭 Pic 1 (Bắt buộc)** | `Image 1` — Mèo mướp vàng béo (Chef Cat) | Ảnh rõ mặt & toàn thân mèo vàng 3D đội nón đầu bếp + tạp dề |
+| **🎭 Pic 2 (Tuỳ chọn)** | `Image 2` — Chó Corgi lùn (Corgi Puppy) | Ảnh Corgi 3D đeo khăn bandana đỏ, rõ tai to |
+| **🎭 Pic 3 (Tuỳ chọn)** | `Image 3` — Gấu mèo Raccoon (Snack Bandit) | Ảnh Raccoon 3D cầm thìa gỗ, rõ vằn đuôi |
+| **🎭 Pic 4 (Tuỳ chọn)** | `Image 4` — Chuột Hamster má phúng | Ảnh Hamster 3D má tròn xoe đứng 2 chân |
+| **🌄 Background (Tuỳ chọn)** | `Image 5` — Bếp đêm | Ảnh phòng bếp có tủ lạnh phát sáng (tỉ lệ dọc 9:16) |
+
+---
+
+## ⚙️ THÔNG SỐ KHUYẾN NGHỊ TRÊN GRADIO (TỐI ƯU 9:16)
+
+| Thông số | Giá trị | Ghi chú |
+| :--- | :--- | :--- |
+| **Tỉ lệ khung hình** | `9:16 (720x1280) · HD 720p Dọc` | Hoặc `480x832` nếu GPU < 24GB |
+| **Thời lượng mỗi cảnh** | `10` giây | 3 cảnh × 10s = 30s tự ghép |
+| **FPS** | `24` | |
+| **MSR LoRA Strength** | `1.0` ⭐ | Tăng từ 0.85 → giữ nhân vật chặt hơn |
+| **Video CFG** | `2.5` ⭐ | Tăng từ 1.5 → bám prompt & speech tốt hơn |
+| **Reference Strength** | `0.85` ⭐ | Tăng từ 0.7 → ít bị đổi nhân vật ở Stage 2 |
+| **Reference Frames** | `33` | Mặc định MSR chính thức |
+| **Stage 2 (Upscale x2)** | `Bật ✅` | Stage 2 giờ giữ nguyên msr_strength (không giảm nữa) |
+| **Low VRAM Mode** | `Bật ✅` | Bắt buộc với GPU < 24GB |
+
+> 💡 **Nếu nhân vật vẫn bị đổi**: Tăng **Reference Strength** lên `0.9–1.0` và **LoRA Strength** lên `1.1–1.2`.
+> 💡 **Nếu video bị artifact/cứng**: Giảm **Video CFG** xuống `2.0` và **Reference Strength** xuống `0.75`.
+
 
 ---
 

@@ -29,78 +29,86 @@ Image 5: Scene, vertical 9:16 composition, a cozy modern lounge and meeting room
 ## 📌 PHẦN 2: PROMPT CHÍNH - HÀNH ĐỘNG & KỊCH BẢN 9:16 (`prompt_main`)
 > *Dán toàn bộ 18 phân đoạn bên dưới vào ô **② Prompt chính (hành động / kịch bản)**. Quy tắc: **Mỗi Shot 10 giây chỉ có 1 nhân vật phát ngôn chính** và **khóa góc quay liên tục (no camera cuts/no morphing)**.*
 
+> 🎙️ **VOICE LANGUAGE DIRECTIVE (TOÀN BỘ VIDEO):** `[VOICE LANGUAGE: Vietnamese] [TTS: vi-VN] [SPEECH LANGUAGE: Vietnamese] [AUDIO LANGUAGE: Vietnamese]` — **Tất cả lời thoại [SPEECH] phải được đọc bằng giọng tiếng Việt (Vietnamese). Không dùng tiếng Anh. Lip-sync theo âm tiết tiếng Việt.**
+
 ```text
+[GLOBAL VOICE SETTINGS]
+Speech language: Vietnamese (vi-VN)
+TTS language: Vietnamese
+Audio language: Vietnamese
+All dialogue must be spoken in Vietnamese language only. No English speech.
+
 [Shot 1 - 00:00 to 00:10 | Act 1: The Paranoia Trigger]
 Continuous vertical shot inside the tense meeting room, locked close-up on Figure 3 (The Paranoid Raccoon). Figure 3 furiously holds a magnifying glass over an empty boba cup on the table, adjusting its thick wire glasses with twitching paws, eyes wild with paranoid panic, speaking in rapid frantic cadence as red strings on the whiteboard loom in the background. Consistent character identity, continuous single camera take, no morphing, no mid-shot cut.
-[SPEECH - Raccoon]: "Đây không đơn thuần là ly trà sữa bị hút trộm! Đây là một đòn tâm lý chiến nhằm tiêu diệt niềm tin nội bộ!"
+[VOICE: Vietnamese vi-VN] [SPEECH - Raccoon]: "Đây không đơn thuần là ly trà sữa bị hút trộm! Đây là một đòn tâm lý chiến nhằm tiêu diệt niềm tin nội bộ!"
 
 [Shot 2 - 00:10 to 00:20 | Act 1: The Machiavellian Gaslight]
 Continuous vertical medium shot focusing on Figure 1 (The Gaslighter Boss Cat) sitting upright at the head of the conference table. Figure 1 rests paws gently on the table, adjusting its rimless glasses, leaning forward with a saintly yet deeply manipulative feline purr, tilting its head with calculated pseudo-empathy, gesturing smoothly as it guilt-trips the entire room. Stable cinematic lighting, continuous single camera take, no morphing.
-[SPEECH - BossCat]: "Chúng ta là một gia đình... Kẻ trộm trà sữa không có lỗi, lỗi là cả phòng đã không đủ bao dung để chia sẻ!"
+[VOICE: Vietnamese vi-VN] [SPEECH - BossCat]: "Chúng ta là một gia đình... Kẻ trộm trà sữa không có lỗi, lỗi là cả phòng đã không đủ bao dung để chia sẻ!"
 
 [Shot 3 - 00:20 to 00:30 | Act 1: The Primal Rage Eruption]
 Continuous vertical dynamic shot focused on Figure 2 (The Rageholic Bulldog). Figure 2 slams both front paws violently onto the conference table, wrinkly face turning red with veins popping, barking and roaring straight toward the camera in cartoonish explosive fury, shaking its spiked collar. Single locked continuous camera take, expressive comedic rage motion.
-[SPEECH - Bulldog]: "Bao dung cái con khỉ! Đứa nào uống cạn trân châu hoàng kim của tao? Bước ra đây solo 1 mất 1 còn!"
+[VOICE: Vietnamese vi-VN] [SPEECH - Bulldog]: "Bao dung cái con khỉ! Đứa nào uống cạn trân châu hoàng kim của tao? Bước ra đây solo 1 mất 1 còn!"
 
 [Shot 4 - 00:30 to 00:40 | Act 2: The Repressed People-Pleaser]
 Continuous vertical shot locked on Figure 4 (The Corgi Pleaser). Figure 4 cowers in its seat, nervously hugging a tiny apology notepad with short paws, perky ears drooping down, trembling mouth curled into a tortured polite smile, eyes watery with Stockholm syndrome guilt, whining in panicked self-blame. Consistent framing, no cuts, natural subtle shivers.
-[SPEECH - Corgi]: "Em xin lỗi cả nhà... Dù em mới đi vệ sinh vào, nhưng chắc chắn là do hào quang tội lỗi của em gây ra!"
+[VOICE: Vietnamese vi-VN] [SPEECH - Corgi]: "Em xin lỗi cả nhà... Dù em mới đi vệ sinh vào, nhưng chắc chắn là do hào quang tội lỗi của em gây ra!"
 
 [Shot 5 - 00:40 to 00:50 | Act 2: The Toxic Passive-Aggression]
 Continuous vertical close-up shot on Figure 4 (The Corgi shifting to Drama Queen). Figure 4 suddenly perks its ears up, casting a razor-sharp judgmental side-eye across the room, smirking with venomous sweet sarcasm and mock innocence while whispering loudly into the camera. Sharp cinematic focus, continuous single take.
-[SPEECH - Corgi]: "Em không có ý phán xét đâu nha, nhưng ai đó mang tiếng sếp lớn ăn cá hồi mà đi tiếc ly trà sữa 30k thì hơi bần đấy ạ!"
+[VOICE: Vietnamese vi-VN] [SPEECH - Corgi]: "Em không có ý phán xét đâu nha, nhưng ai đó mang tiếng sếp lớn ăn cá hồi mà đi tiếc ly trà sữa 30k thì hơi bần đấy ạ!"
 
 [Shot 6 - 00:50 to 01:00 | Act 2: The Dunning-Kruger Boss]
 Continuous vertical shot focusing on Figure 1 (The Gaslighter Boss Cat). Figure 1 puffs its chest out, swinging its tail pompously, raising a paw with supreme baseless confidence, lecturing Figure 3 and Figure 2 with an arrogant feline smirk. Smooth locked camera, no morphing.
-[SPEECH - BossCat]: "Với tư duy lãnh đạo đỉnh cao của loài mèo, tôi khẳng định đây là bài test tâm lý do ban giám đốc cài vào!"
+[VOICE: Vietnamese vi-VN] [SPEECH - BossCat]: "Với tư duy lãnh đạo đỉnh cao của loài mèo, tôi khẳng định đây là bài test tâm lý do ban giám đốc cài vào!"
 
 [Shot 7 - 01:00 to 01:10 | Act 3: Analysis Paralysis Chaos]
 Continuous vertical rapid-zoom shot locked on Figure 3 (The Paranoid Raccoon). Figure 3 is frantically drawing 50 interconnected arrows and pie charts on the whiteboard with two squeaking markers, tail twitching hysterically, spinning around to face the camera in sheer existential dread. Continuous tracking take, no cuts.
-[SPEECH - Raccoon]: "Theo ma trận tâm lý tội phạm học: Ly trà sữa bị uống lúc 3h15 phút... trùng khớp với giờ sao Thủy nghịch hành!"
+[VOICE: Vietnamese vi-VN] [SPEECH - Raccoon]: "Theo ma trận tâm lý tội phạm học: Ly trà sữa bị uống lúc 3h15 phút... trùng khớp với giờ sao Thủy nghịch hành!"
 
 [Shot 8 - 01:10 to 01:20 | Act 3: Mass Guilt-Tripping]
 Continuous vertical high-angle shot focusing on Figure 1 (The Gaslighter Boss Cat). Figure 1 clutches its chest with one paw theatrically, squeezing out fake crocodile tears, shaking its whiskers with profound sorrow, pointing a claw around the room while manipulating collective guilt. Consistent character render, no morphing.
-[SPEECH - BossCat]: "Các em làm tôi đau lòng quá! Nếu ngày mai công ty phá sản, chính là vì sự ích kỷ của từng người trong phòng này!"
+[VOICE: Vietnamese vi-VN] [SPEECH - BossCat]: "Các em làm tôi đau lòng quá! Nếu ngày mai công ty phá sản, chính là vì sự ích kỷ của từng người trong phòng này!"
 
 [Shot 9 - 01:20 to 01:30 | Act 3: Melodramatic Grief & Regret]
 Continuous vertical low-angle shot focusing on Figure 2 (The Rageholic Bulldog). His furious rage instantly collapses into absurd sobbing grief; Figure 2 slumps onto the floor, hugging the empty boba cup to its wrinkly cheek like a lost baby, howling in hyperbolic tragedy toward the ceiling. Continuous locked camera take.
-[SPEECH - Bulldog]: "Trân châu ơi sao mày bỏ tao đi... Tao đã dặn thêm 70% đường 30% đá mà bọn ác nhân nỡ cướp mất!"
+[VOICE: Vietnamese vi-VN] [SPEECH - Bulldog]: "Trân châu ơi sao mày bỏ tao đi... Tao đã dặn thêm 70% đường 30% đá mà bọn ác nhân nỡ cướp mất!"
 
 [Shot 10 - 01:30 to 01:40 | Act 4: Schadenfreude & Live-Stream]
 Continuous vertical medium shot focusing on Figure 4 (The Corgi). Figure 4 hides a tiny smartphone under the table with its paws, secretly live-streaming the office breakdown while stifling mischievous laughter, eyes glittering with dark joy at others' drama, whispering behind a fluffy paw. Continuous single take.
-[SPEECH - Corgi]: "Alo mạng xã hội ơi! Team em đang đấu tố sinh tử vì ly trà sữa, vào xem drama nghìn mắt xem sếp mèo diễn xiếc nào!"
+[VOICE: Vietnamese vi-VN] [SPEECH - Corgi]: "Alo mạng xã hội ơi! Team em đang đấu tố sinh tử vì ly trà sữa, vào xem drama nghìn mắt xem sếp mèo diễn xiếc nào!"
 
 [Shot 11 - 01:40 to 01:50 | Act 4: The Ultimate Catharsis Eruption]
 Continuous vertical dramatic hero shot locked on Figure 4 (The Corgi). Figure 4 suddenly snaps; its polite smile rips into an unhinged wild toothy grin, tearing the apology notepad to shreds with teeth and paws, slamming paws down and barking at the top of lungs in glorious psychotic liberation. Dramatic low lighting, no cuts.
-[SPEECH - Corgi]: "Đủ rồi! Tôi nhịn các người suốt 3 năm nay rồi! Tôi không nhận lỗi nữa, tôi nguyền rủa tất cả các người!"
+[VOICE: Vietnamese vi-VN] [SPEECH - Corgi]: "Đủ rồi! Tôi nhịn các người suốt 3 năm nay rồi! Tôi không nhận lỗi nữa, tôi nguyền rủa tất cả các người!"
 
 [Shot 12 - 01:50 to 02:00 | Act 4: The Spineless Mob Mentality]
 Continuous vertical shot on Figure 2 (The Rageholic Bulldog). Excited and energized by the mutiny, Figure 2 instantly swaps sides, clapping front paws in wild applause, wagging stubby tail, and howling approval to join the uprising. Continuous dynamic take.
-[SPEECH - Bulldog]: "Chí lý! Tôi đồng ý với đồng chí Corgi! Khởi nghĩa đi! Lương Sơn Bạc công sở muôn năm!"
+[VOICE: Vietnamese vi-VN] [SPEECH - Bulldog]: "Chí lý! Tôi đồng ý với đồng chí Corgi! Khởi nghĩa đi! Lương Sơn Bạc công sở muôn năm!"
 
 [Shot 13 - 02:00 to 02:10 | Act 5: Cognitive Dissonance Overload]
 Continuous vertical disorienting shot focusing on Figure 3 (The Paranoid Raccoon). Figure 3 sits on the floor amidst scattered papers, holding its furry head with both paws, eyes swirling in dizzy spirals as its brain short-circuits from contradictory psychological biases, chattering in philosophical breakdown. Continuous single take.
-[SPEECH - Raccoon]: "Nếu ai cũng là nạn nhân... thì ai là thủ phạm? Trà sữa có thật không hay chỉ là ảo ảnh của tiềm thức?!"
+[VOICE: Vietnamese vi-VN] [SPEECH - Raccoon]: "Nếu ai cũng là nạn nhân... thì ai là thủ phạm? Trà sữa có thật không hay chỉ là ảo ảnh của tiềm thức?!"
 
 [Shot 14 - 02:10 to 02:20 | Act 5: The Narcissistic Collapse]
 Continuous vertical dramatic spotlight shot zooming onto Figure 1 (The Gaslighter Boss Cat). Sunlight hits its face, revealing a distinct brown boba syrup stain smeared across its white whiskers and pink nose. Figure 1 freezes, its smug look shattering into pure pale shock, nervously stammering as it twitches its ears. Locked continuous take.
-[SPEECH - BossCat]: "Vết... vết này là sốt cá hồi hữu cơ tôi ăn từ sáng... Thề có trời đất chứng giám tôi không hề..."
+[VOICE: Vietnamese vi-VN] [SPEECH - BossCat]: "Vết... vết này là sốt cá hồi hữu cơ tôi ăn từ sáng... Thề có trời đất chứng giám tôi không hề..."
 
 [Shot 15 - 02:20 to 02:30 | Act 5: Primal Betrayal Shock]
 Continuous vertical tracking shot on Figure 2 (The Rageholic Bulldog). Figure 2 points a trembling paw at Figure 1's stained whiskers, jaw dropping in hyper-dramatic cartoon betrayal shock, whimper cracking between disbelief and ultimate heartbreak. Continuous locked framing.
-[SPEECH - Bulldog]: "Mày bảo 'Chúng ta là một gia đình'... mà mày lại lén hút hết 100% đường của tao hả con mèo kia?!"
+[VOICE: Vietnamese vi-VN] [SPEECH - Bulldog]: "Mày bảo 'Chúng ta là một gia đình'... mà mày lại lén hút hết 100% đường của tao hả con mèo kia?!"
 
 [Shot 16 - 02:30 to 02:40 | Act 6: Absurd Psychological Projection]
 Continuous vertical medium shot focusing on Figure 3 (The Paranoid Raccoon). Backed into a corner, Figure 3 dramatically points its paws toward the office refrigerator, attempting the final absurd defense mechanism of psychological projection, chattering with frantic gravity. Continuous single take.
-[SPEECH - Raccoon]: "Đây rõ ràng là lỗi của phong thủy chiếc tủ lạnh! Chiếc tủ lạnh có tần số năng lượng độc hại phát ra sóng thao túng!"
+[VOICE: Vietnamese vi-VN] [SPEECH - Raccoon]: "Đây rõ ràng là lỗi của phong thủy chiếc tủ lạnh! Chiếc tủ lạnh có tần số năng lượng độc hại phát ra sóng thao túng!"
 
 [Shot 17 - 02:40 to 02:50 | Act 6: The Plot Twist Bombshell]
 Continuous vertical deadpan shot locked on Figure 4 (The Corgi). Figure 4 casually kicks a trash bin forward, dusting its paws, leaning toward the camera with an utterly unimpressed, soul-crushing doggy smirk, dropping the final bombshell. Continuous single take.
-[SPEECH - Corgi]: "Mà quên chưa nói: Ly trà sữa đó của con bé thực tập để quên từ tuần trước thiu ngắt rồi, anh mèo hút ngon miệng ghê!"
+[VOICE: Vietnamese vi-VN] [SPEECH - Corgi]: "Mà quên chưa nói: Ly trà sữa đó của con bé thực tập để quên từ tuần trước thiu ngắt rồi, anh mèo hút ngon miệng ghê!"
 
 [Shot 18 - 02:50 to 03:00 | Act 6: Collective Enlightenment & Meme Ending]
 Continuous vertical wide shot of all 4 animal characters (Figure 1, Figure 2, Figure 3, Figure 4) in the messy meeting room. All 4 freeze simultaneously, Figure 1 clutching its churning stomach with wide panicked eyes, Figure 2 and Figure 3 gagging, Figure 4 grinning smugly. All slowly turn heads in unison to stare dead-center into the camera with an awkward meme smile. Locked continuous shot, comedic pause.
-[SPEECH - BossCat]: "Tâm lý học hành vi chứng minh rằng: 99% drama trên đời sinh ra từ việc... rảnh rỗi sinh nông nổi!"
+[VOICE: Vietnamese vi-VN] [SPEECH - BossCat]: "Tâm lý học hành vi chứng minh rằng: 99% drama trên đời sinh ra từ việc... rảnh rỗi sinh nông nổi!"
 ```
 
 ---
