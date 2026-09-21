@@ -55,30 +55,76 @@ MINIMAX_MODELS = [
 
 
 def download_models(models):
-    """Tai ve cac model con thieu, bo qua file da ton tai."""
+    """Tai ve cac model con thieu, ho tro aria2c de tang toc gap 5-10 lan."""
+    has_aria2 = os.system("which aria2c > /dev/null 2>&1") == 0
     for url, dest in models:
-        if os.path.exists(dest):
+        if os.path.exists(dest) and os.path.getsize(dest) > 1024 * 1024 * 50:
             size_mb = os.path.getsize(dest) / 1024 / 1024
-            print(f"✅ Da co ({size_mb:.0f} MB): {os.path.basename(dest)}")
+            print(f"✅ Da co san ({size_mb:.0f} MB): {os.path.basename(dest)}")
             continue
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        print(f"⬇️  Dang tai: {os.path.basename(dest)} ...")
-        exit_code = os.system(
-            f'wget -q --show-progress -c "{url}" -O "{dest}"'
-        )
+        dest_dir = os.path.dirname(dest)
+        dest_name = os.path.basename(dest)
+        os.makedirs(dest_dir, exist_ok=True)
+        print(f"⬇️  Dang tai: {dest_name} ...")
+        if has_aria2:
+            cmd = f'aria2c -c -x 16 -s 16 -k 1M -d "{dest_dir}" -o "{dest_name}" "{url}"'
+        else:
+            cmd = f'wget -q --show-progress -c "{url}" -O "{dest}"'
+        exit_code = os.system(cmd)
         if exit_code == 0 and os.path.exists(dest):
             size_mb = os.path.getsize(dest) / 1024 / 1024
-            print(f"✅ Xong ({size_mb:.0f} MB): {os.path.basename(dest)}")
+            print(f"✅ Xong ({size_mb:.0f} MB): {dest_name}")
         else:
-            print(f"❌ Loi khi tai: {os.path.basename(dest)}")
+            print(f"❌ Loi khi tai: {dest_name}")
+
+
+def setup_comfyui(target_dir="/content/ComfyUI"):
+    """Cài đặt mã nguồn ComfyUI an toàn kể cả khi thư mục /content/ComfyUI đã chứa models."""
+    main_py = os.path.join(target_dir, "main.py")
+    if os.path.exists(main_py):
+        return True
+
+    print("🔄 Đang thiết lập mã nguồn ComfyUI vào /content/ComfyUI...")
+    if not os.path.exists(target_dir):
+        os.system(f"git clone https://github.com/comfyanonymous/ComfyUI {target_dir}")
+    else:
+        # Thư mục /content/ComfyUI đã tồn tại (do tạo folder models trước),
+        # git clone trực tiếp sẽ lỗi 'destination path already exists and is not an empty directory'.
+        # Giải pháp: clone vào temp rồi copy toàn bộ code sang mà không làm mất models đã tải.
+        temp_dir = "/content/temp_comfyui"
+        os.system(f"rm -rf {temp_dir}")
+        os.system(f"git clone https://github.com/comfyanonymous/ComfyUI {temp_dir}")
+        if os.path.exists(temp_dir):
+            os.system(f"cp -rn {temp_dir}/* {target_dir}/ 2>/dev/null || true")
+            os.system(f"cp -rn {temp_dir}/.* {target_dir}/ 2>/dev/null || true")
+            os.system(f"rm -rf {temp_dir}")
+
+    req_path = os.path.join(target_dir, "requirements.txt")
+    if os.path.exists(req_path):
+        os.system(f"pip install -q -r {req_path}")
+
+    return os.path.exists(main_py)
 
 
 print("=" * 60)
-print("  MiniMax H3 --- Tai Model (Phan 1/2)")
+print("  MiniMax H3 --- Cài Đặt Môi Trường & Tải Model (Cell 1/2)")
 print("=" * 60)
+
+# Cài aria2 để tải model nhanh gấp 5-10 lần
+os.system("apt-get -y install -qq aria2 > /dev/null 2>&1 || true")
+
+# 1. Đảm bảo mã nguồn ComfyUI đã sẵn sàng
+setup_comfyui(COMFYUI_ROOT)
+
+# 2. Cài đặt các thư viện cần thiết cho MiniMax H3 và Gradio
+print("📦 Đang kiểm tra & cài đặt thư viện cần thiết...")
+os.system("pip install -q uv")
+os.system("uv pip install -q --system gradio opencv-python accelerate diffusers einops sentencepiece av spandrel aiohttp || pip install -q gradio opencv-python accelerate diffusers einops sentencepiece av spandrel aiohttp")
+
+# 3. Tải toàn bộ model MiniMax H3
 download_models(MINIMAX_MODELS)
-print("\n🎉 Hoan tat! Tat ca model MiniMax H3 da san sang.")
-print("   👉 Tiep theo: chay Cell Phan 2 de mo giao dien tao video.")
+print("\n🎉 HOÀN TẤT CELL 1! Tất cả mã nguồn & model MiniMax H3 đã sẵn sàng.")
+print("   👉 Bây giờ bạn hãy chạy tiếp CELL 2 bên dưới để mở giao diện.")
 
 
 # ==========================================================================
@@ -137,16 +183,32 @@ TURBO_LORA_FILENAME = "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensor
 # ------------------------------------------------------------------
 # SERVER HELPERS
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# SERVER HELPERS
+# ------------------------------------------------------------------
 _SERVER_STATE = {"running_low_vram": None, "custom_nodes_mtime": None}
+COMFYUI_DIR = "/content/ComfyUI"
+COMFYUI_LOG_PATH = "/content/comfyui.log"
 
 
 def is_server_running(port=8188):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(("127.0.0.1", port)) == 0
+    """Kiểm tra server qua cả HTTP API và socket."""
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/system_stats")
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            return resp.status == 200
+    except Exception:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            return s.connect_ex(("127.0.0.1", port)) == 0
+    except Exception:
+        return False
 
 
 def _get_custom_nodes_mtime():
-    cn_dir = "/content/ComfyUI/custom_nodes"
+    cn_dir = os.path.join(COMFYUI_DIR, "custom_nodes")
     try:
         mtimes = []
         for entry in os.scandir(cn_dir):
@@ -163,39 +225,122 @@ def _get_custom_nodes_mtime():
         return 0.0
 
 
-def ensure_server(low_vram, boot_timeout=300):
+def ensure_server(low_vram, boot_timeout=120):
+    """Đảm bảo ComfyUI server đang chạy với khả năng bắt lỗi tức thì qua log."""
+    main_py = os.path.join(COMFYUI_DIR, "main.py")
+
+    # 1. Kiểm tra ComfyUI đã được cài đặt chưa
+    if not os.path.exists(main_py):
+        print("⚠️ Chưa tìm thấy /content/ComfyUI/main.py! Đang thiết lập ComfyUI...")
+        setup_comfyui(COMFYUI_DIR)
+        if not os.path.exists(main_py):
+            raise RuntimeError(
+                "❌ Không tìm thấy file /content/ComfyUI/main.py!\n"
+                "Thư mục /content/ComfyUI đã tồn tại sẵn nên không thể git clone trực tiếp.\n"
+                "Hãy chạy lệnh sau trong 1 ô Code riêng trên Colab để giải quyết:\n"
+                "!git clone https://github.com/comfyanonymous/ComfyUI /content/temp_comfyui && cp -rn /content/temp_comfyui/* /content/ComfyUI/ && rm -rf /content/temp_comfyui\n"
+                "!pip install -r /content/ComfyUI/requirements.txt"
+            )
+
     current_mtime = _get_custom_nodes_mtime()
-    need_restart = (
-        not is_server_running()
-        or _SERVER_STATE["running_low_vram"] != low_vram
-        or _SERVER_STATE["custom_nodes_mtime"] != current_mtime
-    )
-    if not need_restart:
-        return
-    os.system("fuser -k 8188/tcp")
+
+    # 2. Nếu server đã chạy sẵn và không cần đổi low_vram -> giữ nguyên
+    if is_server_running():
+        if _SERVER_STATE["running_low_vram"] is None or (
+            _SERVER_STATE["running_low_vram"] == low_vram
+            and _SERVER_STATE["custom_nodes_mtime"] == current_mtime
+        ):
+            _SERVER_STATE["running_low_vram"] = low_vram
+            _SERVER_STATE["custom_nodes_mtime"] = current_mtime
+            return
+
+    # 3. Tắt tiến trình cũ triệt để trước khi khởi động lại
+    os.system("fuser -k 8188/tcp 2>/dev/null || true")
+    os.system("pkill -9 -f 'python.*main.py' 2>/dev/null || true")
     time.sleep(2)
-    os.chdir("/content/ComfyUI")
+
+    # 4. Thiết lập biến môi trường và file log
+    os.chdir(COMFYUI_DIR)
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    cmd = ["python", "main.py"]
+    log_out = open(COMFYUI_LOG_PATH, "w", encoding="utf-8", errors="ignore")
+
+    cmd = ["python", "-u", "main.py", "--listen", "127.0.0.1", "--port", "8188"]
     if low_vram:
-        cmd.insert(2, "--cache-none")
-    subprocess.Popen(cmd)
+        cmd.append("--lowvram")
+
+    # 5. Khởi động ComfyUI
+    proc = subprocess.Popen(
+        cmd,
+        cwd=COMFYUI_DIR,
+        stdout=log_out,
+        stderr=subprocess.STDOUT,
+    )
+
     waited = 0
+    poll_interval = 2
     while not is_server_running():
-        time.sleep(2)
-        waited += 2
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+        # 🚨 BẮT LỖI NGAY NẾU TIẾN TRÌNH CRASH (không bắt người dùng đợi 300s!)
+        ret = proc.poll()
+        if ret is not None:
+            log_out.flush()
+            log_out.close()
+            tail_lines = ""
+            try:
+                with open(COMFYUI_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                    tail_lines = "".join(f.readlines()[-35:])
+            except Exception:
+                tail_lines = "Không đọc được file log."
+            raise RuntimeError(
+                f"❌ ComfyUI crash ngay khi khởi động (Exit code: {ret})!\n"
+                f"Chi tiết nguyên nhân từ log:\n"
+                f"--------------------------------------------------\n"
+                f"{tail_lines}\n"
+                f"--------------------------------------------------"
+            )
+
         if waited > boot_timeout:
-            raise RuntimeError(f"Server khong khoi dong duoc sau {boot_timeout}s.")
+            log_out.flush()
+            log_out.close()
+            tail_lines = ""
+            try:
+                with open(COMFYUI_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                    tail_lines = "".join(f.readlines()[-35:])
+            except Exception:
+                tail_lines = "Không đọc được file log."
+            raise RuntimeError(
+                f"❌ Server không phản hồi sau {boot_timeout}s!\n"
+                f"Chi tiết log (/content/comfyui.log):\n"
+                f"--------------------------------------------------\n"
+                f"{tail_lines}\n"
+                f"--------------------------------------------------"
+            )
+
     _SERVER_STATE["running_low_vram"] = low_vram
     _SERVER_STATE["custom_nodes_mtime"] = current_mtime
 
 
 def force_restart_server():
-    os.system("fuser -k 8188/tcp")
+    os.system("fuser -k 8188/tcp 2>/dev/null || true")
+    os.system("pkill -9 -f 'python.*main.py' 2>/dev/null || true")
     time.sleep(2)
     _SERVER_STATE["running_low_vram"] = None
     _SERVER_STATE["custom_nodes_mtime"] = None
-    return "Server da tat. Lan tao video tiep theo se tu khoi dong lai."
+    return "🟢 Server đã tắt. Lần tạo video tiếp theo sẽ tự khởi động lại."
+
+
+def read_server_log():
+    """Đọc 40 dòng log mới nhất của ComfyUI server."""
+    if not os.path.exists(COMFYUI_LOG_PATH):
+        return "ℹ️ Chưa có file log (Server chưa từng khởi động)."
+    try:
+        with open(COMFYUI_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+            return "".join(lines[-40:]) if lines else "ℹ️ Log rỗng."
+    except Exception as e:
+        return f"⚠️ Lỗi đọc log: {e}"
 
 
 # ------------------------------------------------------------------
@@ -209,119 +354,100 @@ def get_seed(v_seed):
     return random.randint(1, 999_999_999) if v == -1 else v
 
 
-def parse_resolution(ratio_str):
-    """Chuyen chuoi ti le -> (width, height)."""
-    table = {
-        "16:9 (1344x768)":  (1344, 768),
-        "9:16 (768x1344)":  (768,  1344),
-        "1:1  (1056x1056)": (1056, 1056),
-        "16:9 (864x480)":   (864,  480),
-        "9:16 (480x864)":   (480,  864),
-    }
-    for key, val in table.items():
-        if key in ratio_str:
-            return val
-    return 1344, 768  # fallback
-
-
-def duration_to_length(duration_s: float, fps: int = 24) -> int:
-    """Chuyen duration (giay) -> so frame hop le cho MiniMax H3.
-
-    Cong thuc tu workflow.json (node ComfyMathExpression):
-        frames = max(5, round(duration * fps))
-        frames = frames + (5 - frames % 17) % 17   # snap len boi cua 17 gan nhat
-    """
-    frames = max(5, round(duration_s * fps))
-    frames = frames + (5 - frames % 17) % 17
-    return frames
-
-
-def split_prompts(text):
-    if not text or not text.strip():
-        return []
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    blocks = re.split(r"\n[ \t]*\n+", normalized.strip())
-    return [b.strip() for b in blocks if b.strip()]
-
-
-def count_scenes(text):
-    n = len(split_prompts(text))
-    return f"🔹 **So phan canh nhan dien duoc:** {n}"
-
-
-def find_latest_video(output_dir=OUTPUT_DIR):
-    mp4_files = (
-        glob.glob(f"{output_dir}*.mp4")
-        + glob.glob(f"{output_dir}output/*.mp4")
-        + glob.glob(f"{output_dir}video/*.mp4")
-    )
-    if not mp4_files:
-        return None
-    return max(mp4_files, key=os.path.getmtime)
-
-
-def has_audio_stream(video_path):
-    cmd = ["ffprobe", "-v", "error", "-select_streams", "a",
-           "-show_entries", "stream=index", "-of", "csv=p=0", video_path]
+def free_comfyui_memory():
+    """Hủy bỏ job đang chạy dở và giải phóng sạch sẽ GPU VRAM và System RAM."""
+    # 1. Gửi lệnh ngắt tiến trình render ngay lập tức
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        return bool(result.stdout.strip())
-    except Exception:
-        return True
-
-
-def ensure_audio_track(video_path):
-    if has_audio_stream(video_path):
-        return video_path
-    fixed_path = video_path.rsplit(".", 1)[0] + "_silentaudio.mp4"
-    cmd = [
-        "ffmpeg", "-y", "-i", video_path,
-        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-        "-shortest", "-c:v", "copy", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0",
-        fixed_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0 and os.path.exists(fixed_path):
-        return fixed_path
-    return video_path
-
-
-def concat_videos(video_list, out_name, output_dir=OUTPUT_DIR):
-    safe_video_list = [ensure_audio_track(v) for v in video_list]
-    concat_file_path = os.path.join(output_dir, f"concat_{out_name}.txt")
-    with open(concat_file_path, "w") as f:
-        for vid in safe_video_list:
-            f.write(f"file '{os.path.abspath(vid)}'\n")
-    final_output = os.path.join(output_dir, f"{out_name}_{int(time.time())}.mp4")
-    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file_path,
-           "-c:v", "libx264", "-c:a", "aac", "-pix_fmt", "yuv420p", final_output]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0 or not os.path.exists(final_output):
-        raise RuntimeError(
-            "Ghep noi video bang ffmpeg that bai. "
-            "Cac file phan doan le van con trong thu muc output."
+        req = urllib.request.Request(
+            "http://127.0.0.1:8188/interrupt",
+            data=b"{}",
+            headers={"Content-Type": "application/json"}
         )
-    return final_output
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+
+    # 2. Xóa sạch hàng đợi
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:8188/queue",
+            data=json.dumps({"clear": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+
+    # 3. Yêu cầu ComfyUI unload model khỏi VRAM và dọn cache
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:8188/free",
+            data=json.dumps({"unload_models": True, "free_memory": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+
+    # 4. Thu hồi bộ nhớ PyTorch CUDA
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    return "🟢 Đã hủy job và giải phóng toàn bộ GPU VRAM & System RAM thành công!"
 
 
-def submit_and_wait(workflow, scene_label="", max_wait_seconds=1800, poll_interval=2):
+def get_comfyui_progress_line():
+    """Trích xuất dòng tiến độ sampling gần nhất từ comfyui.log."""
+    if not os.path.exists(COMFYUI_LOG_PATH):
+        return ""
+    try:
+        with open(COMFYUI_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        for l in reversed(lines[-20:]):
+            l_str = l.strip()
+            if "%" in l_str or "it/s" in l_str or "s/it" in l_str:
+                clean = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', l_str)
+                return clean[:100]
+            if "Executing node" in l_str:
+                clean = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', l_str)
+                return clean[:100]
+    except Exception:
+        pass
+    return ""
+
+
+def parse_resolution(ratio_str):
+    """Chuyen chuoi ti le -> (width, height). Tối ưu 864x480 cho Colab."""
+    if "864x480" in ratio_str:  return 864,  480
+    if "480x864" in ratio_str:  return 480,  864
+    if "1344x768" in ratio_str: return 1344, 768
+    if "768x1344" in ratio_str: return 768,  1344
+    if "1056x1056" in ratio_str: return 1056, 1056
+    return 864, 480
+
+
+def submit_and_wait_gen(workflow, scene_label="", max_wait_seconds=1800, poll_interval=3):
+    """Generator theo dõi tiến độ thời gian thực và tự động giải phóng VRAM khi xong/lỗi."""
     data = json.dumps({"prompt": workflow}).encode("utf-8")
     req  = urllib.request.Request("http://127.0.0.1:8188/prompt", data=data)
     try:
         response  = urllib.request.urlopen(req, timeout=30)
         prompt_id = json.loads(response.read())["prompt_id"]
     except urllib.error.HTTPError as e:
-        try:
-            body = e.read().decode("utf-8")
-        except Exception:
-            body = str(e)
-        raise RuntimeError(f"ComfyUI tu choi workflow: {body[:800]}")
+        body = e.read().decode("utf-8", errors="ignore")
+        free_comfyui_memory()
+        raise RuntimeError(f"ComfyUI từ chối workflow: {body[:800]}")
     except Exception as e:
-        raise RuntimeError(f"Loi gui job API: {e}")
+        free_comfyui_memory()
+        raise RuntimeError(f"Lỗi gửi job API: {e}")
 
     waited = 0
     consecutive_errors = 0
-    MAX_CONSECUTIVE_ERRORS = 10  # ~20s loi lien tiep moi coi la crash
+    MAX_CONSECUTIVE_ERRORS = 15
 
     while waited < max_wait_seconds:
         try:
@@ -330,7 +456,9 @@ def submit_and_wait(workflow, scene_label="", max_wait_seconds=1800, poll_interv
                 timeout=30).read())
             consecutive_errors = 0
             if str(prompt_id) in history:
-                return prompt_id
+                yield True, prompt_id, "Hoàn tất"
+                return
+
             queue = json.loads(urllib.request.urlopen(
                 urllib.request.Request("http://127.0.0.1:8188/queue"), timeout=30).read())
             is_running = any(
@@ -338,19 +466,37 @@ def submit_and_wait(workflow, scene_label="", max_wait_seconds=1800, poll_interv
                 for job in queue.get("queue_running", []) + queue.get("queue_pending", [])
             )
             if not is_running:
-                raise RuntimeError(f"Render that bai o {scene_label}")
+                free_comfyui_memory()
+                raise RuntimeError(f"Render thất bại ở {scene_label}")
+
+            p_line = get_comfyui_progress_line()
+            elapsed_m = waited // 60
+            elapsed_s = waited % 60
+            prog_text = f"[{elapsed_m:02d}m{elapsed_s:02d}s] {p_line}" if p_line else f"[{elapsed_m:02d}m{elapsed_s:02d}s] Đang tính toán sampling..."
+            yield False, prompt_id, prog_text
+
         except RuntimeError:
+            free_comfyui_memory()
             raise
         except Exception:
             consecutive_errors += 1
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                free_comfyui_memory()
                 raise RuntimeError(
-                    f"Server khong phan hoi sau {consecutive_errors * poll_interval}s "
-                    f"lien tiep o {scene_label}!"
+                    f"Server không phản hồi sau {consecutive_errors * poll_interval}s "
+                    f"liên tiếp ở {scene_label}!"
                 )
+
         time.sleep(poll_interval)
         waited += poll_interval
-    raise RuntimeError(f"Timeout: {scene_label} qua {max_wait_seconds // 60} phut.")
+
+    # HỦY VÀ GIẢI PHÓNG VRAM NGAY KHI TIMEOUT!
+    free_comfyui_memory()
+    raise RuntimeError(
+        f"Timeout: {scene_label} quá {max_wait_seconds // 60} phút!\n"
+        f"🟢 Đã tự động hủy job và giải phóng GPU VRAM / System RAM.\n"
+        f"💡 KHUYÊN DÙNG: Bật '⚡ Dùng Lightning LoRA (4 steps)' và chọn độ phân giải '864x480' để render chỉ mất 2-4 phút/cảnh!"
+    )
 
 
 # ------------------------------------------------------------------
@@ -639,12 +785,24 @@ def generate_minimax_gradio(
             pic3_name      = pic3_name,
         )
 
-        # Timeout dong: ~4 phut/giay video, toi thieu 10 phut
-        scene_timeout = max(600, int(duration_s) * 240)
+        # Timeout động: Nếu dùng 4-step Turbo thì tối đa 15 phút (thường chạy 2-4 phút), nếu 20-step thì cho phép tới 45 phút!
+        if use_turbo_lora:
+            scene_timeout = max(900, int(duration_s) * 150)
+        else:
+            scene_timeout = max(2700, int(duration_s) * 400)
 
         try:
-            submit_and_wait(wf, scene_label=label, max_wait_seconds=scene_timeout)
+            for is_done, p_id, prog_msg in submit_and_wait_gen(wf, scene_label=label, max_wait_seconds=scene_timeout):
+                if not is_done:
+                    yield generated_videos, None, (
+                        f"🔄 Đang render {label} [{mode_note}]... (Seed: {seed_i})\n"
+                        f"⏳ Tiến độ: {prog_msg}\n"
+                        f"📝 Nội dung: {p[:120]}..."
+                    )
+                else:
+                    break
         except RuntimeError as e:
+            free_comfyui_memory()
             yield generated_videos, None, f"❌ {e}"; return
 
         latest_video = find_latest_video()
@@ -675,11 +833,11 @@ def generate_minimax_gradio(
 # GRADIO UI
 # ------------------------------------------------------------------
 ratio_choices = [
-    "16:9 (1344x768)",
-    "9:16 (768x1344)",
-    "1:1  (1056x1056)",
-    "16:9 (864x480)",
-    "9:16 (480x864)",
+    "16:9 (864x480) ⭐ Khuyên dùng trên Colab (Nhanh x3, nhẹ VRAM)",
+    "9:16 (480x864) ⭐ Khuyên dùng (Khung dọc TikTok/Reels)",
+    "16:9 (1344x768) (HD 720p - Chậm, cần >25 phút/cảnh)",
+    "9:16 (768x1344) (HD 720p dọc - Chậm, cần >25 phút/cảnh)",
+    "1:1  (1056x1056) (Vuông)",
 ]
 
 custom_css = """
@@ -743,8 +901,11 @@ with gr.Blocks(
                 )
             with gr.Column(scale=1, min_width=160):
                 restart_btn = gr.Button("🔄 Restart Server", size="sm")
+                free_btn = gr.Button("🧹 Giải Phóng VRAM", size="sm")
+                log_btn = gr.Button("📋 Xem Log Server", size="sm")
                 restart_out = gr.Markdown("🟢 San sang")
         restart_btn.click(fn=force_restart_server, outputs=[restart_out])
+        free_btn.click(fn=free_comfyui_memory, outputs=[restart_out])
 
     with gr.Row():
         # COT TRAI: INPUTS
@@ -837,9 +998,9 @@ with gr.Blocks(
                         info="beta / normal thuong tot hon simple cho ref2va",
                     )
                     turbo_mm = gr.Checkbox(
-                        label="⚡ Dung Lightning LoRA (4 steps --- nhanh x5)",
-                        value=False,
-                        info="Bat de xem thu nhanh. Chat luong giam nhe so voi 20-step.",
+                        label="⚡ Dùng Lightning LoRA (4 steps --- nhanh gấp 5 lần)",
+                        value=True,
+                        info="BẬT (Khuyên dùng): Chỉ ~2-4 phút/cảnh. TẮT (20 steps): Cần ~25-35 phút/cảnh.",
                     )
                 ref_size_mm = gr.Radio(
                     label="ref_image_size",
@@ -901,10 +1062,22 @@ with gr.Blocks(
         ],
         outputs=[gallery_mm, video_out_mm, mm_status],
     )
+    def on_clear():
+        free_comfyui_memory()
+        return None, None, "🟢 Đã dọn dẹp hàng đợi và giải phóng GPU VRAM / System RAM!", "🔹 **Số phân cảnh nhận diện được:** 0"
+
     mm_clear.click(
-        fn=lambda: (None, None, "", "🔹 **So phan canh nhan dien duoc:** 0"),
+        fn=on_clear,
         outputs=[gallery_mm, video_out_mm, mm_status, scene_count_display],
     )
+    log_btn.click(fn=read_server_log, outputs=[mm_status])
+
+print("🔄 Đang khởi động ComfyUI server trước khi mở giao diện...")
+try:
+    ensure_server(low_vram=True)
+    print("🟢 ComfyUI server đã sẵn sàng hoạt động!")
+except Exception as e:
+    print(f"⚠️ {e}")
 
 demo.queue()
 demo.launch(
