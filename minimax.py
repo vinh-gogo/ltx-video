@@ -9,6 +9,10 @@
 #                       minimax_h3_audio_vae_fp32.safetensors
 #   loras/            : minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors  (tuỳ chọn)
 #
+# Ghi chú: bộ model này KHÔNG đổi dù bạn dùng 3 hay 4 (hay tới 9) ảnh tham khảo
+# ở Cell 2 --- node MiniMaxH3ReferenceToVideo hỗ trợ sẵn tới 9 ref_image trong
+# cùng 1 checkpoint, không cần tải thêm gì khác.
+#
 # Cấu trúc thư mục sau khi tải:
 #   ComfyUI/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors
 #   ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
@@ -128,11 +132,17 @@ print("   👉 Bây giờ bạn hãy chạy tiếp CELL 2 bên dưới để m�
 
 
 # ==========================================================================
-# PHAN 2: TAO VIDEO TU ANH THAM KHAO (MiniMax H3 ref2va)
+# PHAN 2: TAO VIDEO TU ANH THAM KHAO (MiniMax H3 ref2va) --- BAN 4 ANH THAM KHAO
 # ==========================================================================
-# @title [Cell Phan 2] MiniMax H3 --- Tao Video Tu Anh Tham Khao
+# @title [Cell Phan 2] MiniMax H3 --- Tao Video Tu Anh Tham Khao (4 Pic)
 #
 # Workflow tuong ung: workflow.json (MiniMaxH3ReferenceToVideo)
+#
+# GHI CHU NANG CAP: node MiniMaxH3ReferenceToVideo cua ComfyUI ho tro san
+# toi da 9 anh tham khao (ref_image_0 ... ref_image_8, tuong ung <Picture 1>
+# ... <Picture 9> trong prompt). Ban goc chi wire 3 slot (Pic1-3); ban nay
+# mo rong len 4 slot (Pic1-4) giong so luong nhan vat cua LTX-2.5 MSR.
+# Neu muon them nua (toi da 9), chi can lap lai dung pattern cua Pic4 ben duoi.
 #
 # Pipeline node:
 #   UNETLoader                -> minimax_h3_ref2va_pruned_int8_convrot.safetensors
@@ -142,15 +152,15 @@ print("   👉 Bây giờ bạn hãy chạy tiếp CELL 2 bên dưới để m�
 #   LoraLoaderModelOnly       -> minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors
 #   ComfySwitchNode (model)   -> bat/tat LoRA
 #   ComfySwitchNode (steps)   -> chon so buoc full vs turbo
-#   MiniMaxH3ReferenceToVideo -> conditioning + latent (node chinh)
+#   MiniMaxH3ReferenceToVideo -> conditioning + latent (node chinh, nhan 4 ref_image)
 #   BasicGuider               -> guider
-#   KSamplerSelect            -> res_multistep
-#   BasicScheduler            -> beta/normal/simple
-#   SamplerCustomAdvanced     -> sampling
-#   VAEDecode                 -> giai ma video frames
-#   VAEDecodeAudio            -> giai ma audio
-#   CreateVideo               -> mux video + audio -> VIDEO
-#   SaveVideo                 -> ghi file mp4
+#   KSamplerSelect             -> res_multistep
+#   BasicScheduler             -> beta/normal/simple
+#   SamplerCustomAdvanced      -> sampling
+#   VAEDecode                  -> giai ma video frames
+#   VAEDecodeAudio              -> giai ma audio
+#   CreateVideo                -> mux video + audio -> VIDEO
+#   SaveVideo                  -> ghi file mp4
 
 get_ipython().system("pip install -q gradio opencv-python")
 
@@ -180,9 +190,6 @@ VIDEO_VAE_FILENAME  = "minimax_h3_video_vae_fp16.safetensors"
 AUDIO_VAE_FILENAME  = "minimax_h3_audio_vae_fp32.safetensors"
 TURBO_LORA_FILENAME = "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
 
-# ------------------------------------------------------------------
-# SERVER HELPERS
-# ------------------------------------------------------------------
 # ------------------------------------------------------------------
 # SERVER HELPERS
 # ------------------------------------------------------------------
@@ -267,6 +274,13 @@ def ensure_server(low_vram, boot_timeout=120):
     cmd = ["python", "-u", "main.py", "--listen", "127.0.0.1", "--port", "8188"]
     if low_vram:
         cmd.append("--lowvram")
+        # QUAN TRONG: --cache-none tat han cache ket qua node cua ComfyUI.
+        # Neu thieu co nay, khi render nhieu canh lien tuc voi cung 1 bo model
+        # (UNET/CLIP/VAE khong doi, chi doi "prompt" text) ComfyUI co the coi
+        # cac node phia sau la "chua doi" va tra ve VIDEO CU thay vi render lai
+        # --> gay ra loi 1 canh bi lap lai nhieu lan. Bat buoc phai co de dam
+        # bao moi phan canh deu duoc render moi hoan toan.
+        cmd.append("--cache-none")
 
     # 5. Khởi động ComfyUI
     proc = subprocess.Popen(
@@ -430,6 +444,74 @@ def parse_resolution(ratio_str):
     return 864, 480
 
 
+# ---- CAC HAM CON THIEU O BAN GOC (da bo sung o day) -----------------------
+def split_prompts(prompt_main):
+    """Tách prompt chính thành danh sách các phân cảnh, cách nhau bởi 1 dòng trống."""
+    if not prompt_main:
+        return []
+    parts = re.split(r'\n\s*\n', prompt_main.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def count_scenes(prompt_main):
+    """Cập nhật hiển thị số phân cảnh nhận diện được trong prompt (dùng cho UI)."""
+    n = len(split_prompts(prompt_main))
+    return f"🔹 **Số phân cảnh nhận diện được:** {n}"
+
+
+def duration_to_length(duration_s, fps):
+    """Đổi (giây, fps) -> số frame 'length' hợp lệ cho MiniMax H3.
+
+    Dùng công thức phổ biến ở các model video-diffusion dạng latent-frame
+    (4n + 1), tương tự Wan/LTX. NẾU ComfyUI báo lỗi 'length' không hợp lệ ở
+    node MiniMaxH3ReferenceToVideo, hãy đối chiếu lại workflow.json gốc và
+    chỉnh công thức này cho khớp.
+    """
+    raw = int(round(float(duration_s) * float(fps)))
+    n = max(1, round((raw - 1) / 4))
+    return 4 * n + 1
+
+
+def find_latest_video(output_dir=OUTPUT_DIR):
+    """Tìm file video mới nhất trong output/ (bao gồm cả thư mục con 'video/')."""
+    candidates = []
+    for pat in ("**/*.mp4", "**/*.webm", "**/*.mkv"):
+        candidates.extend(glob.glob(os.path.join(output_dir, pat), recursive=True))
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def concat_videos(video_paths, output_name):
+    """Ghép nhiều video thành 1 bằng ffmpeg concat demuxer (fallback re-encode nếu codec lệch)."""
+    list_path = os.path.join(OUTPUT_DIR, f"{output_name}_list.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for v in video_paths:
+            f.write(f"file '{os.path.abspath(v)}'\n")
+
+    output_path = os.path.join(OUTPUT_DIR, f"{output_name}.mp4")
+    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", output_path]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0 or not os.path.exists(output_path):
+        # Fallback: re-encode khi các phân cảnh có codec/tham số lệch nhau
+        # (giữ chất lượng cao: CRF 18, preset slow, audio AAC 192k)
+        cmd_reencode = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+            "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            output_path,
+        ]
+        result2 = subprocess.run(cmd_reencode, capture_output=True, text=True)
+        if result2.returncode != 0 or not os.path.exists(output_path):
+            raise RuntimeError(f"ffmpeg concat lỗi: {result.stderr[-500:]}\n{result2.stderr[-500:]}")
+
+    os.remove(list_path)
+    return output_path
+# -----------------------------------------------------------------------
+
+
 def submit_and_wait_gen(workflow, scene_label="", max_wait_seconds=1800, poll_interval=3):
     """Generator theo dõi tiến độ thời gian thực và tự động giải phóng VRAM khi xong/lỗi."""
     data = json.dumps({"prompt": workflow}).encode("utf-8")
@@ -448,6 +530,11 @@ def submit_and_wait_gen(workflow, scene_label="", max_wait_seconds=1800, poll_in
     waited = 0
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 15
+    # Grace period: bỏ qua kiểm tra "not is_running" trong vài vòng poll đầu,
+    # vì ngay sau khi submit, job có thể chưa kịp xuất hiện trong /queue.
+    # Thiếu grace period sẽ gây báo lỗi giả (false "Render thất bại").
+    GRACE_POLLS = 3
+    poll_count = 0
 
     while waited < max_wait_seconds:
         try:
@@ -465,7 +552,8 @@ def submit_and_wait_gen(workflow, scene_label="", max_wait_seconds=1800, poll_in
                 str(job[1]) == str(prompt_id)
                 for job in queue.get("queue_running", []) + queue.get("queue_pending", [])
             )
-            if not is_running:
+            poll_count += 1
+            if not is_running and poll_count > GRACE_POLLS:
                 free_comfyui_memory()
                 raise RuntimeError(f"Render thất bại ở {scene_label}")
 
@@ -500,7 +588,7 @@ def submit_and_wait_gen(workflow, scene_label="", max_wait_seconds=1800, poll_in
 
 
 # ------------------------------------------------------------------
-# BUILD WORKFLOW  (MiniMax H3 ref2va --- theo workflow.json)
+# BUILD WORKFLOW  (MiniMax H3 ref2va --- theo workflow.json, 4 ANH THAM KHAO)
 # ------------------------------------------------------------------
 def build_minimax_workflow(
     *,
@@ -518,6 +606,7 @@ def build_minimax_workflow(
     pic1_name=None,
     pic2_name=None,
     pic3_name=None,
+    pic4_name=None,  # <-- MOI: anh tham khao thu 4
 ):
     """Xay dung ComfyUI API workflow cho MiniMax H3 ref2va.
 
@@ -538,6 +627,12 @@ def build_minimax_workflow(
       - VAEDecodeAudio (id 121)            -> giai ma audio
       - CreateVideo (id 130)               -> mux video + audio
       - SaveVideo (id 92)                  -> ghi file mp4
+
+    Ghi chu ve so luong anh tham khao: node MiniMaxH3ReferenceToVideo cho phep
+    toi da 9 anh (ref_image_0 ... ref_image_8 <-> <Picture 1> ... <Picture 9>
+    trong prompt). Ham nay hien dang wire 4 slot (pic1_name..pic4_name); neu
+    muon them nua, chi can them tham so pic5_name... va noi them 1 dong vao
+    danh sach ref_slots ben duoi theo dung pattern.
     """
     if seed is None:
         seed = random.randint(1, 999_999_999)
@@ -601,8 +696,8 @@ def build_minimax_workflow(
             "inputs": {"noise_seed": int(seed)},
         },
         # MiniMaxH3ReferenceToVideo (node chinh, id 136)
-        # Prompt dung tag <Picture 1>, <Picture 2>, <Picture 3>
-        # de tham chieu anh theo dung thu tu slot ref_image_0/1/2
+        # Prompt dung tag <Picture 1>, <Picture 2>, <Picture 3>, <Picture 4>
+        # de tham chieu anh theo dung thu tu slot ref_image_0/1/2/3
         "ref2va": {
             "class_type": "MiniMaxH3ReferenceToVideo",
             "inputs": {
@@ -682,11 +777,12 @@ def build_minimax_workflow(
         },
     }
 
-    # Them anh tham khao vao ref2va
+    # Them anh tham khao vao ref2va (4 slot: Pic1-4 <-> <Picture 1>-<Picture 4>)
     ref_slots = [
         ("ref_images.ref_image_0", pic1_name),
         ("ref_images.ref_image_1", pic2_name),
         ("ref_images.ref_image_2", pic3_name),
+        ("ref_images.ref_image_3", pic4_name),  # <-- MOI
     ]
     for slot_key, img_name in ref_slots:
         if img_name:
@@ -701,10 +797,10 @@ def build_minimax_workflow(
 
 
 # ------------------------------------------------------------------
-# GENERATE --- HAM GRADIO GENERATOR
+# GENERATE --- HAM GRADIO GENERATOR (4 ANH THAM KHAO)
 # ------------------------------------------------------------------
 def generate_minimax_gradio(
-    pic1_path, pic2_path, pic3_path,
+    pic1_path, pic2_path, pic3_path, pic4_path,  # <-- MOI: pic4_path
     prompt_main,
     aspect_ratio, duration_s, fps, seed_val, num_segments, fixed_seed,
     scheduler, use_turbo_lora, ref_image_size,
@@ -739,8 +835,9 @@ def generate_minimax_gradio(
     pic1_name = _copy_img(pic1_path, "pic1")
     pic2_name = _copy_img(pic2_path, "pic2")
     pic3_name = _copy_img(pic3_path, "pic3")
+    pic4_name = _copy_img(pic4_path, "pic4")  # <-- MOI
 
-    loaded = [s for s in [pic1_name, pic2_name, pic3_name] if s]
+    loaded = [s for s in [pic1_name, pic2_name, pic3_name, pic4_name] if s]  # <-- da them pic4_name
 
     # Quyet dinh danh sach phan canh
     if len(prompts) > 1:
@@ -783,6 +880,7 @@ def generate_minimax_gradio(
             pic1_name      = pic1_name,
             pic2_name      = pic2_name,
             pic3_name      = pic3_name,
+            pic4_name      = pic4_name,  # <-- MOI
         )
 
         # Timeout động: Nếu dùng 4-step Turbo thì tối đa 15 phút (thường chạy 2-4 phút), nếu 20-step thì cho phép tới 45 phút!
@@ -894,7 +992,7 @@ with gr.Blocks(
                     Len den 2K * 24fps * ~15 giay/clip
 
                     <div style="margin-top:4px; opacity:0.9; font-size:0.9rem;">
-                    MiniMax H3 * Toi da 3 anh tham khao * Audio sinh native *
+                    MiniMax H3 * Toi da 4 anh tham khao * Audio sinh native *
                     Ghep noi chuoi canh tu dong
                     </div>
                     """
@@ -917,8 +1015,9 @@ with gr.Blocks(
                     "<div class='info-box'>"
                     "Tai anh tham khao nhan vat / boi canh. Trong prompt, tham chieu bang "
                     "<code>&lt;Picture 1&gt;</code>, <code>&lt;Picture 2&gt;</code>, "
-                    "<code>&lt;Picture 3&gt;</code> theo dung thu tu slot. "
-                    "Chi <b>Pic 1</b> bat buoc."
+                    "<code>&lt;Picture 3&gt;</code>, <code>&lt;Picture 4&gt;</code> theo dung "
+                    "thu tu slot. Chi <b>Pic 1</b> bat buoc. "
+                    "(Node MiniMax H3 goc ho tro toi da 9 anh neu ban muon mo rong them.)"
                     "</div>"
                 )
                 with gr.Row():
@@ -926,13 +1025,15 @@ with gr.Blocks(
                         label="🎭 Pic 1 — Nhan vat / boi canh 1 (bat buoc)", type="filepath"
                     )
                     mm_pic2 = gr.Image(label="🎭 Pic 2 — Tuy chon", type="filepath")
-                mm_pic3 = gr.Image(label="🎭 Pic 3 — Tuy chon", type="filepath")
+                with gr.Row():
+                    mm_pic3 = gr.Image(label="🎭 Pic 3 — Tuy chon", type="filepath")
+                    mm_pic4 = gr.Image(label="🎭 Pic 4 — Tuy chon", type="filepath")  # <-- MOI
 
             with gr.Group():
                 gr.Markdown("### 📝 Prompt")
                 gr.Markdown(
                     "<div class='info-box'>"
-                    "Dung tag <code>&lt;Picture 1&gt;</code>, <code>&lt;Picture 2&gt;</code> "
+                    "Dung tag <code>&lt;Picture 1&gt;</code> ... <code>&lt;Picture 4&gt;</code> "
                     "de tham chieu anh. "
                     "Moi phan canh cach nhau <b>1 dong trong</b>. "
                     "MiniMax H3 sinh <b>audio native</b> --- mo ta am thanh / giong noi "
@@ -946,13 +1047,13 @@ with gr.Blocks(
                     label="Prompt chinh (moi phan canh cach nhau 1 dong trong)",
                     lines=8,
                     placeholder=(
-                        "Use <Picture 1> as the main character.\n\n"
+                        "Use <Picture 1> as the main character and <Picture 2> as his sidekick.\n\n"
                         "CUT 1: Close-up of <Picture 1> standing on a rooftop at night, "
                         "red cape billowing in the wind. He says 'Get ready to meet your maker!' "
                         "with dramatic echo reverb. City neon lights glitter below.\n\n"
-                        "CUT 2: Wide hero shot --- <Picture 1> leaps off the edge toward camera, "
-                        "a massive explosion erupts behind him, debris flying outward, "
-                        "deep cinematic BOOM sound effect fills the air."
+                        "CUT 2: Wide hero shot --- <Picture 1> and <Picture 2> leap off the edge "
+                        "toward camera, a massive explosion erupts behind them, debris flying "
+                        "outward, deep cinematic BOOM sound effect fills the air."
                     ),
                 )
 
@@ -1000,7 +1101,7 @@ with gr.Blocks(
                     turbo_mm = gr.Checkbox(
                         label="⚡ Dùng Lightning LoRA (4 steps --- nhanh gấp 5 lần)",
                         value=True,
-                        info="BẬT (Khuyên dùng): Chỉ ~2-4 phút/cảnh. TẮT (20 steps): Cần ~25-35 phút/cảnh.",
+                        info="BẬT (Khuyên dùng): Chỉ ~2-4 phút/cảnh. TẮT (20 steps): Cần ~25-35 phút/cảnh, chất lượng cao hơn.",
                     )
                 ref_size_mm = gr.Radio(
                     label="ref_image_size",
@@ -1038,14 +1139,15 @@ with gr.Blocks(
             gr.Markdown(
                 "<div class='info-box'>"
                 "<b>💡 Meo dung MiniMax H3:</b><br>"
-                "* Tham chieu anh bang <code>&lt;Picture 1&gt;</code>, "
-                "<code>&lt;Picture 2&gt;</code> ngay trong prompt.<br>"
+                "* Tham chieu anh bang <code>&lt;Picture 1&gt;</code> ... "
+                "<code>&lt;Picture 4&gt;</code> ngay trong prompt.<br>"
                 "* Mo ta <b>am thanh / giong noi</b> truc tiep --- model sinh audio native.<br>"
                 "* Dung <b>Turbo LoRA 4-step</b> de xem thu truoc, sau do tat de "
-                "render full 20-step.<br>"
+                "render full 20-step (chat luong cao nhat, chuyen dong muot hon).<br>"
                 "* <b>ref_image_size = max</b> giu nhan vat ro net hon nhung cham hon.<br>"
                 "* Moi canh cach nhau 1 dong trong --- he thong tu render tung canh "
-                "roi ghep noi thanh phim hoan chinh."
+                "roi ghep noi thanh phim hoan chinh (ghep khong-re-encode neu cung codec, "
+                "giu nguyen chat luong goc)."
                 "</div>"
             )
 
@@ -1054,7 +1156,7 @@ with gr.Blocks(
     mm_btn.click(
         fn=generate_minimax_gradio,
         inputs=[
-            mm_pic1, mm_pic2, mm_pic3,
+            mm_pic1, mm_pic2, mm_pic3, mm_pic4,  # <-- MOI: mm_pic4
             mm_prompt,
             ratio_mm, duration_mm, fps_mm, seed_mm, num_seg_mm, fixed_seed_mm,
             scheduler_mm, turbo_mm, ref_size_mm,
@@ -1062,6 +1164,7 @@ with gr.Blocks(
         ],
         outputs=[gallery_mm, video_out_mm, mm_status],
     )
+
     def on_clear():
         free_comfyui_memory()
         return None, None, "🟢 Đã dọn dẹp hàng đợi và giải phóng GPU VRAM / System RAM!", "🔹 **Số phân cảnh nhận diện được:** 0"
