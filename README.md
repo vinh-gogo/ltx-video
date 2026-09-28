@@ -115,10 +115,10 @@ Mô hình LTX-2.5 yêu cầu [Hugging Face Access Token](https://huggingface.co/
 
 ---
 
-## 📜 Giấy phép (License)
+## 📜 Giấy phép & Đóng góp (License & Contributing)
 
-Dự án này được phát hành theo giấy phép mã nguồn mở **[MIT License](LICENSE)**.
-
+- Dự án này được phát hành theo giấy phép mã nguồn mở **[MIT License](LICENSE)**.
+- Mọi đóng góp (Pull Request, Code, Kịch bản, Workflow) đều tuân theo **[Thỏa thuận cấp phép người đóng góp (CONTRIBUTING.md)](CONTRIBUTING.md)**.
 - Trọng số mô hình **LTX-2.5** tuân thủ theo giấy phép của **Lightricks Ltd.** ([Lightricks LTX-2.5 License](https://huggingface.co/Lightricks/LTX-2.5)).
 - Trọng số mô hình **MiniMax H3** tuân thủ theo điều khoản của **MiniMax / Comfy-Org** ([MiniMax Terms](https://huggingface.co/Comfy-Org/MiniMax-H3)).
 
