@@ -1,4 +1,4 @@
-# 🎬 SERIES KỊCH BẢN VIDEO HÀI BỰA TÂM LÝ HỌC 9:16: "108 ANH HÀO TÂM LÝ HỌC CÔNG SỞ"
+﻿# 🎬 SERIES KỊCH BẢN VIDEO HÀI BỰA TÂM LÝ HỌC 9:16: "108 ANH HÀO TÂM LÝ HỌC CÔNG SỞ"
 > *(Phong cách Animal Comedy ẩn dụ hành vi con người — 108 nét tính cách Thủy Hử)*
 > File điều khiển: **`minimax.py`** — MiniMax H3 `ref2va`, **sinh audio stereo NATIVE** trong cùng 1 lượt.
 > Tuân thủ 100% bộ quy tắc tại [`kich_ban_minimax_h3.md`](./kich_ban_minimax_h3.md).
@@ -115,7 +115,7 @@ Cinematic 3D Pixar-style animal workplace comedy, hyper-exaggerated cartoon acti
 # 📸 GÁN ẢNH THAM KHẢO TRÊN GIAO DIỆN GRADIO (`minimax.py`)
 
 > MiniMax H3 **chỉ có 3 ô upload** (`ref_image_0/1/2`) — ít hơn 4 nhân vật + 1 nền của bản gốc.
-> Ảnh nguồn vẫn nằm đầy đủ trong thư mục `scrpits/psychology/`.
+> Ảnh nguồn vẫn nằm đầy đủ trong thư mục `scripts/psychology/`.
 
 | Ô Upload trong UI | Nhân vật / Bối cảnh | File ảnh nguồn | Ghi chú |
 | :--- | :--- | :--- | :--- |
@@ -329,10 +329,12 @@ Toàn bộ code tải model + dựng ComfyUI + mở giao diện nằm trong **`m
 
 ---
 
-# 🖼️ MỘT SỐ KHOẢNH KHẮC ĐÃ CÓ SẴN TRONG THƯ MỤC `scrpits/minimax_h3/`
+# 🖼️ MỘT SỐ KHOẢNH KHẮC ĐÃ CÓ SẴN TRONG THƯ MỤC `scripts/minimax_h3/`
 
 | File | Dùng làm gì |
 | :--- | :--- |
 | `pic1_superboy_rooftop.jpg` | Ví dụ `<Picture 1>` — nhân vật chính |
 | `pic2_mecha_dragon.jpg` | Ví dụ `<Picture 2>` — nhân vật đối đầu / vật thể |
 | `pic3_city_backdrop.jpg` | Ví dụ `<Picture 3>` — bối cảnh |
+
+

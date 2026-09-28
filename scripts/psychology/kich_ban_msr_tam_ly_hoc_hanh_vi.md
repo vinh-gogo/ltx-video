@@ -1,4 +1,4 @@
-# 🎬 SERIES KỊCH BẢN VIDEO HÀI BỰA TÂM LÝ HỌC 9:16: "108 ANH HÀO TÂM LÝ HỌC CÔNG SỞ"
+﻿# 🎬 SERIES KỊCH BẢN VIDEO HÀI BỰA TÂM LÝ HỌC 9:16: "108 ANH HÀO TÂM LÝ HỌC CÔNG SỞ"
 > *(Phong cách Animal Comedy ẩn dụ hành vi con người - 108 nét tính cách Thủy Hử)*
 
 - **Thể loại:** Hài bựa châm biếm sâu cay (Dark Satirical Animal Comedy), Phim tâm lý học hành vi con người mượn hình tượng động vật siêu biểu cảm.
@@ -200,7 +200,7 @@ subtitles, watermark, text, signature, low quality, worst quality, blurry, defor
 
 # 💡 HƯỚNG DẪN GÁN ẢNH THAM KHẢO TRÊN GIAO DIỆN GRADIO
 
-| Ô Upload trong UI | Nhân vật / Bối cảnh | File ảnh có sẵn trong thư mục `scrpits/psychology/` |
+| Ô Upload trong UI | Nhân vật / Bối cảnh | File ảnh có sẵn trong thư mục `scripts/psychology/` |
 | :--- | :--- | :--- |
 | **🎭 Pic 1 (Bắt buộc)** | **Figure 1: Boss Mèo Tuxedo (Tống Giang)** | `msr_pic1_gaslighter_cat_ref.jpg` |
 | **🎭 Pic 2 (Tuỳ chọn)** | **Figure 2: Bulldog Giận Dữ (Lý Quỳ)** | `msr_pic2_bulldog_ref.jpg` |
@@ -223,3 +223,5 @@ subtitles, watermark, text, signature, low quality, worst quality, blurry, defor
 | **Reference Frames** | `33` | Chuẩn MSR chính thức |
 | **Stage 2 (Upscale x2)** | `Bật ✅` | Tăng độ nét chi tiết lông và biểu cảm |
 | **Low VRAM Mode** | `Bật ✅` | Tiết kiệm bộ nhớ GPU tránh tràn VRAM |
+
+
