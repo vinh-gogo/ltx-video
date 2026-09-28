@@ -5,9 +5,9 @@ COMFYUI_ROOT = "/content/ComfyUI"
 
 MINIMAX_MODELS = [
     # ---- 1. Shared Models (CLIP & VAE) ----
-    # Text Encoder — bf16
-    ("https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors", f"{COMFYUI_ROOT}/models/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors"),
+    # Text Encoder — int8 (⭐ KHUYÊN DÙNG: cân bằng chất lượng/VRAM, 27GB)
     ("https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors", f"{COMFYUI_ROOT}/models/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
+    # Text Encoder — fp4 AWQ (nhỏ nhất, 16GB, cho GPU ≤24GB)
     ("https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", f"{COMFYUI_ROOT}/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"),
 
     # Video VAE — fp16 (fallback, vẫn giữ để tương thích)

@@ -191,7 +191,7 @@ def build_minimax_workflow(*, prompt, width, height, duration_s, fps, seed, sche
                            tile_size=512, tile_overlap=128,
                            temporal_size=48, temporal_overlap=40,
                            turbo_variant="8-step v1.0 ⭐",
-                           text_encoder_mode="bf16"):
+                           text_encoder_mode="int8"):
     is_i2v = (op_mode != "MSR (Tham chiếu đa bối cảnh)")
     unet_name = "minimax_h3_fl2va_pruned_int8_convrot.safetensors" if is_i2v else "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
 
@@ -226,27 +226,32 @@ def build_minimax_workflow(*, prompt, width, height, duration_s, fps, seed, sche
 
     # ⭐ Chọn Text Encoder theo precision
     TEXT_ENCODER_MAP = {
-        "bf16": "qwen3vl_32b_minimax_h3_bf16.safetensors",
         "int8": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
         "fp4":  "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
     }
-    clip_name = TEXT_ENCODER_MAP.get(text_encoder_mode, TEXT_ENCODER_MAP["bf16"])
+    clip_name = TEXT_ENCODER_MAP.get(text_encoder_mode, TEXT_ENCODER_MAP["int8"])
+
+    # ⭐ Chọn model source: nếu dùng turbo thì qua LoRA, nếu không thì UNET trực tiếp
+    actual_steps = steps_turbo if use_turbo_lora else steps_full
 
     wf = {
         "unet": {"class_type": "UNETLoader", "inputs": {"unet_name": unet_name, "weight_dtype": "default"}},
         "clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": clip_name, "type": "minimax", "device": "default"}},
         "video_vae": {"class_type": "VAELoader", "inputs": {"vae_name": video_vae_name}},
         "audio_vae": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
-        "turbo_lora": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["unet", 0], "lora_name": lora_name, "strength_model": 1.0}},
-        "model_switch": {"class_type": "ComfySwitchNode", "inputs": {"on_false": ["unet", 0], "on_true": ["turbo_lora", 0], "switch": bool(use_turbo_lora)}},
-        "steps_f": {"class_type": "PrimitiveInt", "inputs": {"value": steps_full}},
-        "steps_t": {"class_type": "PrimitiveInt", "inputs": {"value": steps_turbo}},
-        "steps_sw": {"class_type": "ComfySwitchNode", "inputs": {"on_false": ["steps_f", 0], "on_true": ["steps_t", 0], "switch": bool(use_turbo_lora)}},
         "noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed)}},
         "sampler_sel": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
-        "scheduler_node": {"class_type": "BasicScheduler", "inputs": {"model": ["model_switch", 0], "scheduler": scheduler, "steps": ["steps_sw", 0], "denoise": 1.0}},
-        "sampler": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["noise", 0], "guider": ["guider", 0], "sampler": ["sampler_sel", 0], "sigmas": ["scheduler_node", 0], "latent_image": ["core_node", 1]}},
     }
+
+    # ⭐ Model source: UNET trực tiếp hoặc qua LoRA
+    if use_turbo_lora:
+        wf["turbo_lora"] = {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["unet", 0], "lora_name": lora_name, "strength_model": 1.0}}
+        model_ref = ["turbo_lora", 0]
+    else:
+        model_ref = ["unet", 0]
+
+    wf["scheduler_node"] = {"class_type": "BasicScheduler", "inputs": {"model": model_ref, "scheduler": scheduler, "steps": actual_steps, "denoise": 1.0}}
+    wf["sampler"] = {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["noise", 0], "guider": ["guider", 0], "sampler": ["sampler_sel", 0], "sigmas": ["scheduler_node", 0], "latent_image": ["core_node", 1]}}
 
     # ⭐ VAE Decode: Tiled hoặc Standard
     if use_tiled_decode:
@@ -288,7 +293,7 @@ def build_minimax_workflow(*, prompt, width, height, duration_s, fps, seed, sche
                 wf[nid] = {"class_type": "LoadImage", "inputs": {"image": img}}
                 wf["core_node"]["inputs"][f"ref_images.ref_image_{i}"] = [nid, 0]
 
-    wf["guider"] = {"class_type": "BasicGuider", "inputs": {"model": ["model_switch", 0], "conditioning": ["core_node", 0]}}
+    wf["guider"] = {"class_type": "BasicGuider", "inputs": {"model": model_ref, "conditioning": ["core_node", 0]}}
     return wf
 
 def submit_and_wait_gen(workflow, scene_label="", max_wait_seconds=1800, poll_interval=3):
@@ -548,9 +553,9 @@ with gr.Blocks(title="MiniMax H3 Studio — Upgraded", fill_width=True) as demo:
                     )
                 text_enc_mm = gr.Radio(
                     label="📝 Text Encoder (Qwen3-VL 32B)",
-                    choices=["bf16", "int8", "fp4"],
-                    value="bf16",
-                    info="bf16 (51GB, ⭐ tốt nhất, cần A100 80GB) · int8 (27GB, cần ≥40GB) · fp4 (16GB, cho T4/L4)"
+                    choices=["int8", "fp4"],
+                    value="int8",
+                    info="int8 (27GB, ⭐ khuyên dùng, cần ≥40GB) · fp4 (16GB, cho T4/L4)"
                 )
 
             with gr.Accordion("⚙️ Cài đặt nâng cao", open=False):
