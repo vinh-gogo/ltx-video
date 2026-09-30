@@ -32,12 +32,20 @@ COMFYUI_DIR = "/content/ComfyUI"
 COMFYUI_LOG_PATH = "/content/comfyui.log"
 
 UNET_FILENAME             = globals().get("UNET_FILENAME",             "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors")
-TEXT_ENCODER_FILENAME     = globals().get("TEXT_ENCODER_FILENAME",     "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors")
+TEXT_ENCODER_BF16_FILENAME = "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
+TEXT_ENCODER_BF16_URL      = "https://huggingface.co/Lightricks/LTX-2.5/resolve/main/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
+TEXT_ENCODER_INT8_FILENAME = "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors"
+TEXT_ENCODER_INT8_URL      = "https://huggingface.co/Lightricks/LTX-2.5/resolve/main/text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors"
+TEXT_ENCODER_FILENAME     = globals().get("TEXT_ENCODER_FILENAME",     TEXT_ENCODER_BF16_FILENAME)
 VIDEO_VAE_FILENAME        = globals().get("VIDEO_VAE_FILENAME",        "ltx-2.5-video-vae-bf16.safetensors")
 AUDIO_VAE_FILENAME        = globals().get("AUDIO_VAE_FILENAME",        "ltx-2.5-audio-vae-bf16.safetensors")
 SPATIAL_UPSCALER_FILENAME = globals().get("SPATIAL_UPSCALER_FILENAME", "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors")
 MSR_LORA_FILENAME         = globals().get("MSR_LORA_FILENAME",         "ltx2.5/LTX-2.5-Licon-MSR-V1.safetensors")
 INGREDIENTS_LORA_FILENAME = globals().get("INGREDIENTS_LORA_FILENAME", "ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors")
+DISTILLED_LORA_FILENAME   = globals().get("DISTILLED_LORA_FILENAME",   "ltx-2.5-22b-distilled-lora-450-bf16.safetensors")
+DISTILLED_LORA_URL        = "https://huggingface.co/Lightricks/LTX-2.5/resolve/main/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
+REFINE_DETAILS_LORA_FILENAME = globals().get("REFINE_DETAILS_LORA_FILENAME", "ltx-2.5-22b-ic-lora-refine-details-1.0.safetensors")
+REFINE_DETAILS_LORA_URL      = "https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Refine-Details/resolve/main/ltx-2.5-22b-ic-lora-refine-details-1.0.safetensors"
 
 LATENT_GROUP_FRAMES = 8
 
@@ -46,15 +54,19 @@ SIGMAS_PASS1 = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875,
 SIGMAS_PASS2 = "0.85, 0.7250, 0.4219, 0.0"
 
 QUALITY_PREFIX = (
-    "Cinematic photorealistic 4K ultra-detailed footage, master cinematography, "
-    "sharp focus, professional lighting, natural film grain, "
+    "Cinematic 35mm film footage, soft diffused natural lighting, master cinematography, "
+    "sharp organic focus, subtle film grain, authentic texture, "
 )
 QUALITY_SUFFIX = (
-    ", lifelike textures, smooth cinematic camera movement, highly detailed faces, "
+    ", lifelike skin texture, matte finish, smooth cinematic camera movement, highly detailed features, "
     "temporal consistency, synchronized natural sound and acoustics"
 )
 
 NEGATIVE_PROMPT_DEFAULT = (
+    "oily skin, greasy skin, plastic skin, waxy skin, glossy surface, shiny forehead, "
+    "specular reflection, specular bloom, overexposed, blown out highlights, oversharpened, "
+    "split screen, collage, grid, multiple panels, photo frame, triple view, character sheet, "
+    "lineup, side by side, border, letterbox, white bars, inset image, picture-in-picture, "
     "blurry, oversaturated, pixelated, low resolution, grainy, distorted, noise, "
     "compression artifacts, glitches, watermark, text, logo, subtitles, "
     "static frame, frozen image, lack of motion, deformed limbs, extra paws, duplicate limbs, "
@@ -227,10 +239,12 @@ def parse_aspect_ratio(ratio_str):
 
 def get_seed(v_seed):
     try:
+        if v_seed is None:
+            return 0
         s = int(v_seed)
-        return s if s > 0 else random.randint(1, 999_999_999)
+        return s if s >= 0 else random.randint(1, 999_999_999)
     except (TypeError, ValueError):
-        return random.randint(1, 999_999_999)
+        return 0
 
 
 def apply_quality_wrapping(prompt, use_wrap=True):
@@ -240,12 +254,62 @@ def apply_quality_wrapping(prompt, use_wrap=True):
     return f"{QUALITY_PREFIX}{p}{QUALITY_SUFFIX}"
 
 
+def is_reference_sheet_prompt(text):
+    lower = text.lower()
+    ref_kw = [
+        "master reference sheet", "master model sheet", "character model sheet",
+        "turnaround view", "3 turnaround views", "front view, three-quarter",
+        "inset callout", "model sheet of", "nạp vào pic", "msr slot: pic",
+        "角色设定图", "三视图", "主参考设定图", "三视角", "角色主模型表",
+    ]
+    if any(k in lower for k in ref_kw):
+        if not any(k in lower for k in ["first 4 seconds", "at precisely", "chuyển cảnh", "前4秒", "00:00", "shot 1"]):
+            return True
+        if lower.startswith(("complete anime character", "anime character master", "动漫角色终极主参考设定图", "角色设定图")):
+            return True
+    return False
+
+
 def split_prompts(text):
+    """
+    Tách các phân cảnh thông minh:
+    - Tự động bỏ qua các đoạn Character Reference Sheet / Model Sheet (nếu người dùng copy nhầm cả mô tả tạo ảnh nhân vật).
+    - Bỏ qua các vạch chia '---' hoặc '===' và bóc các khối ```text ... ```.
+    - Loại bỏ tiêu đề phân cảnh (vd: '### Phân cảnh 1: ...') chỉ giữ lại prompt quay phim thực tế.
+    - Làm sạch các tham số Midjourney như '--ar 16:9'.
+    """
     if not text or not text.strip():
         return []
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    blocks = re.split(r"\n[ \t]*\n+", normalized.strip())
-    return [b.strip() for b in blocks if b.strip()]
+    norm = text.replace("\r\n", "\n").replace("\r", "\n")
+    norm = re.sub(r"```[a-zA-Z0-9_-]*", "", norm)
+
+    raw_blocks = re.split(r"\n[ \t]*\n+", norm.strip())
+    all_cleaned = []
+    video_prompts = []
+
+    for b in raw_blocks:
+        b = b.strip()
+        if not b or re.match(r"^[-=*]{3,}$", b):
+            continue
+
+        lines = b.split("\n")
+        if lines[0].strip().startswith(("#", "**Cảnh", "**Scene", "**Phân cảnh", "**Prompt", "**第")) and len(lines) > 1:
+            rest = "\n".join(lines[1:]).strip()
+            if len(rest) > 20:
+                b = rest
+
+        if b.startswith(("#", ">", "|", "Dùng các prompt", "Để đạt tính", "edge-tts", "Bạn có thể", "*")) or "edge-tts" in b:
+            continue
+
+        b_clean = re.sub(r"--(?:ar|v|stylize|s|weird|c|no)\s+[^\s]+", "", b).strip()
+        if not b_clean:
+            continue
+
+        all_cleaned.append(b_clean)
+        if not is_reference_sheet_prompt(b_clean):
+            video_prompts.append(b_clean)
+
+    return video_prompts if video_prompts else all_cleaned
 
 
 def ensure_lora_symlinks():
@@ -254,21 +318,120 @@ def ensure_lora_symlinks():
         lora_dir = os.path.join(COMFYUI_DIR, "models", "loras")
         sub_dir = os.path.join(lora_dir, "ltx2.5")
         os.makedirs(sub_dir, exist_ok=True)
-        msr_file = "LTX-2.5-Licon-MSR-V1.safetensors"
-        src_sub = os.path.join(sub_dir, msr_file)
-        dst_root = os.path.join(lora_dir, msr_file)
-        if os.path.exists(src_sub) and not os.path.exists(dst_root):
-            try:
-                os.symlink(src_sub, dst_root)
-            except Exception:
-                shutil.copy2(src_sub, dst_root)
-        elif os.path.exists(dst_root) and not os.path.exists(src_sub):
-            try:
-                os.symlink(dst_root, src_sub)
-            except Exception:
-                shutil.copy2(dst_root, src_sub)
+        sync_files = [
+            "LTX-2.5-Licon-MSR-V1.safetensors",
+            "ltx-2.5-22b-distilled-lora-450-bf16.safetensors",
+            "ltx-2.5-22b-ic-lora-refine-details-1.0.safetensors",
+        ]
+        for f_name in sync_files:
+            src_sub = os.path.join(sub_dir, f_name)
+            dst_root = os.path.join(lora_dir, f_name)
+            if os.path.exists(src_sub) and not os.path.exists(dst_root):
+                try:
+                    os.symlink(src_sub, dst_root)
+                except Exception:
+                    shutil.copy2(src_sub, dst_root)
+            elif os.path.exists(dst_root) and not os.path.exists(src_sub):
+                try:
+                    os.symlink(dst_root, src_sub)
+                except Exception:
+                    shutil.copy2(dst_root, src_sub)
     except Exception:
         pass
+
+
+def ensure_distilled_lora():
+    """Tự động tải ltx-2.5-22b-distilled-lora-450-bf16.safetensors nếu chưa có."""
+    lora_dir = os.path.join(COMFYUI_DIR, "models", "loras")
+    os.makedirs(lora_dir, exist_ok=True)
+    target = os.path.join(lora_dir, DISTILLED_LORA_FILENAME)
+    if os.path.exists(target) and os.path.getsize(target) > 1024 * 1024 * 10:
+        return True
+
+    hf_token = os.environ.get("HF_TOKEN", "")
+    header = ["--header", f"Authorization: Bearer {hf_token}"] if hf_token else []
+    cmd = [
+        "aria2c", "--console-log-level=warn", "-c",
+        "-x", "8", "-s", "8", "-k", "1M",
+        "-d", lora_dir, "-o", DISTILLED_LORA_FILENAME,
+    ] + header + [DISTILLED_LORA_URL]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True)
+    except Exception:
+        pass
+
+    if not (os.path.exists(target) and os.path.getsize(target) > 1024 * 1024 * 10):
+        try:
+            from huggingface_hub import hf_hub_download
+            hf_hub_download(
+                repo_id="Lightricks/LTX-2.5",
+                filename=f"loras/{DISTILLED_LORA_FILENAME}",
+                local_dir=lora_dir,
+                token=hf_token or None,
+            )
+            downloaded = os.path.join(lora_dir, "loras", DISTILLED_LORA_FILENAME)
+            if os.path.exists(downloaded) and not os.path.exists(target):
+                shutil.move(downloaded, target)
+        except Exception:
+            try:
+                import urllib.request
+                req = urllib.request.Request(DISTILLED_LORA_URL, headers={"User-Agent": "Mozilla/5.0"})
+                if hf_token:
+                    req.add_header("Authorization", f"Bearer {hf_token}")
+                with urllib.request.urlopen(req, timeout=120) as resp, open(target, "wb") as f:
+                    shutil.copyfileobj(resp, f)
+            except Exception:
+                pass
+
+    ensure_lora_symlinks()
+    return os.path.exists(target) and os.path.getsize(target) > 1024 * 1024 * 10
+
+
+def ensure_refine_details_lora():
+    """Tự động tải ltx-2.5-22b-ic-lora-refine-details-1.0.safetensors nếu chưa có."""
+    lora_dir = os.path.join(COMFYUI_DIR, "models", "loras")
+    os.makedirs(lora_dir, exist_ok=True)
+    target = os.path.join(lora_dir, REFINE_DETAILS_LORA_FILENAME)
+    if os.path.exists(target) and os.path.getsize(target) > 1024 * 1024 * 10:
+        return True
+
+    hf_token = os.environ.get("HF_TOKEN", "")
+    header = ["--header", f"Authorization: Bearer {hf_token}"] if hf_token else []
+    cmd = [
+        "aria2c", "--console-log-level=warn", "-c",
+        "-x", "8", "-s", "8", "-k", "1M",
+        "-d", lora_dir, "-o", REFINE_DETAILS_LORA_FILENAME,
+    ] + header + [REFINE_DETAILS_LORA_URL]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True)
+    except Exception:
+        pass
+
+    if not (os.path.exists(target) and os.path.getsize(target) > 1024 * 1024 * 10):
+        try:
+            from huggingface_hub import hf_hub_download
+            hf_hub_download(
+                repo_id="Lightricks/LTX-2.5-22b-IC-LoRA-Refine-Details",
+                filename=REFINE_DETAILS_LORA_FILENAME,
+                local_dir=lora_dir,
+                token=hf_token or None,
+            )
+            downloaded = os.path.join(lora_dir, REFINE_DETAILS_LORA_FILENAME)
+            if os.path.exists(downloaded) and not os.path.exists(target):
+                shutil.move(downloaded, target)
+        except Exception:
+            try:
+                import urllib.request
+                req = urllib.request.Request(REFINE_DETAILS_LORA_URL, headers={"User-Agent": "Mozilla/5.0"})
+                if hf_token:
+                    req.add_header("Authorization", f"Bearer {hf_token}")
+                with urllib.request.urlopen(req, timeout=120) as resp, open(target, "wb") as f:
+                    shutil.copyfileobj(resp, f)
+            except Exception:
+                pass
+
+    ensure_lora_symlinks()
+    return os.path.exists(target) and os.path.getsize(target) > 1024 * 1024 * 10
 
 
 def resolve_comfy_lora_name(target_name, class_type="ComfyUILTX25MSRICLoRALoader"):
@@ -312,6 +475,143 @@ def resolve_comfy_lora_name(target_name, class_type="ComfyUILTX25MSRICLoRALoader
     if os.path.exists(os.path.join(lora_dir, base_target)):
         return base_target
     return target_name
+
+
+def ensure_clip_symlinks():
+    """Đồng bộ symlink giữa models/text_encoders/ và models/clip/ để CLIPLoader luôn nhận diện được."""
+    try:
+        te_dir = os.path.join(COMFYUI_DIR, "models", "text_encoders")
+        clip_dir = os.path.join(COMFYUI_DIR, "models", "clip")
+        os.makedirs(te_dir, exist_ok=True)
+        os.makedirs(clip_dir, exist_ok=True)
+        sync_files = [
+            TEXT_ENCODER_BF16_FILENAME,
+            TEXT_ENCODER_INT8_FILENAME,
+        ]
+        for f_name in sync_files:
+            te_path = os.path.join(te_dir, f_name)
+            clip_path = os.path.join(clip_dir, f_name)
+            if os.path.exists(te_path) and not os.path.exists(clip_path):
+                try:
+                    os.symlink(te_path, clip_path)
+                except Exception:
+                    shutil.copy2(te_path, clip_path)
+            elif os.path.exists(clip_path) and not os.path.exists(te_path):
+                try:
+                    os.symlink(clip_path, te_path)
+                except Exception:
+                    shutil.copy2(clip_path, te_path)
+    except Exception:
+        pass
+
+
+def ensure_text_encoder(filename=None):
+    """Kiểm tra và tự động tải Text Encoder (gemma4 bf16 hoặc int8) nếu chưa có."""
+    if not filename:
+        filename = TEXT_ENCODER_FILENAME
+
+    clean_filename = (
+        TEXT_ENCODER_INT8_FILENAME
+        if "int8" in str(filename).lower()
+        else TEXT_ENCODER_BF16_FILENAME
+    )
+
+    te_dir = os.path.join(COMFYUI_DIR, "models", "text_encoders")
+    clip_dir = os.path.join(COMFYUI_DIR, "models", "clip")
+    os.makedirs(te_dir, exist_ok=True)
+    os.makedirs(clip_dir, exist_ok=True)
+
+    target_te = os.path.join(te_dir, clean_filename)
+    target_clip = os.path.join(clip_dir, clean_filename)
+
+    if (os.path.exists(target_te) and os.path.getsize(target_te) > 1024 * 1024 * 10) or \
+       (os.path.exists(target_clip) and os.path.getsize(target_clip) > 1024 * 1024 * 10):
+        ensure_clip_symlinks()
+        return clean_filename
+
+    url = (
+        TEXT_ENCODER_BF16_URL
+        if clean_filename == TEXT_ENCODER_BF16_FILENAME
+        else TEXT_ENCODER_INT8_URL
+    )
+
+    hf_token = os.environ.get("HF_TOKEN", "")
+    header = ["--header", f"Authorization: Bearer {hf_token}"] if hf_token else []
+    cmd = [
+        "aria2c", "--console-log-level=warn", "-c",
+        "-x", "8", "-s", "8", "-k", "1M",
+        "-d", te_dir, "-o", clean_filename,
+    ] + header + [url]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True)
+    except Exception:
+        pass
+
+    if not (os.path.exists(target_te) and os.path.getsize(target_te) > 1024 * 1024 * 10):
+        try:
+            from huggingface_hub import hf_hub_download
+            hf_hub_download(
+                repo_id="Lightricks/LTX-2.5",
+                filename=f"text_encoders/{clean_filename}",
+                local_dir=te_dir,
+                token=hf_token or None,
+            )
+            downloaded = os.path.join(te_dir, "text_encoders", clean_filename)
+            if os.path.exists(downloaded) and not os.path.exists(target_te):
+                shutil.move(downloaded, target_te)
+        except Exception:
+            try:
+                import urllib.request
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                if hf_token:
+                    req.add_header("Authorization", f"Bearer {hf_token}")
+                with urllib.request.urlopen(req, timeout=300) as resp, open(target_te, "wb") as f:
+                    shutil.copyfileobj(resp, f)
+            except Exception:
+                pass
+
+    ensure_clip_symlinks()
+    return clean_filename
+
+
+def resolve_comfy_clip_name(target_name=None):
+    """
+    Tự động truy vấn ComfyUI /object_info/CLIPLoader để lấy chính xác tên file CLIP/Text Encoder
+    (khắc phục lỗi Validation khi file nằm trong text_encoders/ hoặc clip/).
+    """
+    if not target_name:
+        target_name = TEXT_ENCODER_FILENAME
+
+    clean_target = (
+        TEXT_ENCODER_INT8_FILENAME
+        if "int8" in str(target_name).lower()
+        else TEXT_ENCODER_BF16_FILENAME
+    )
+    base_target = os.path.basename(clean_target)
+    ensure_clip_symlinks()
+
+    try:
+        url = "http://127.0.0.1:8188/object_info/CLIPLoader"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode())
+        opts = data.get("CLIPLoader", {}).get("input", {}).get("required", {}).get("clip_name", [[]])[0]
+        if isinstance(opts, list) and opts:
+            if clean_target in opts:
+                return clean_target
+            for opt in opts:
+                if opt == base_target or os.path.basename(opt) == base_target:
+                    return opt
+            for opt in opts:
+                if base_target.lower() in opt.lower():
+                    return opt
+    except Exception:
+        pass
+
+    for d in [os.path.join(COMFYUI_DIR, "models", "text_encoders"), os.path.join(COMFYUI_DIR, "models", "clip")]:
+        if os.path.exists(os.path.join(d, base_target)):
+            return base_target
+    return clean_target
 
 
 def find_latest_video():
@@ -416,8 +716,8 @@ def build_msr_workflow(
     height=720,
     fps=24,
     duration=10,
-    seed=None,
-    video_cfg=1.5,
+    seed=0,
+    video_cfg=1.1,
     audio_cfg=1.0,
     msr_lora_name=None,
     msr_lora_strength=0.85,
@@ -430,13 +730,19 @@ def build_msr_workflow(
     msr_strength=0.7,
     reference_frames="33",
     run_stage2=True,
+    use_distilled_lora=False,
+    distilled_lora_strength=1.0,
+    text_encoder_name=None,
+    use_refine_lora=True,
+    refine_lora_strength=0.6,
 ):
     if negative_text is None:
         negative_text = NEGATIVE_PROMPT_DEFAULT
     target_lora = msr_lora_name or MSR_LORA_FILENAME or "LTX-2.5-Licon-MSR-V1.safetensors"
     actual_msr_lora = resolve_comfy_lora_name(target_lora, "ComfyUILTX25MSRICLoRALoader")
+    actual_clip_name = resolve_comfy_clip_name(text_encoder_name or TEXT_ENCODER_FILENAME)
     if seed is None:
-        seed = random.randint(1, 999_999_999)
+        seed = 0
 
     safe_fps = snap_fps_safe(fps)
     half_w, half_h = half_dims(width, height)
@@ -452,12 +758,24 @@ def build_msr_workflow(
     # ---- Stage 1: Half Resolution ----
     wf = {
         "S1_unet":  {"class_type": "UNETLoader",  "inputs": {"unet_name": UNET_FILENAME, "weight_dtype": "default"}},
-        "S1_clip":  {"class_type": "CLIPLoader",  "inputs": {"clip_name": TEXT_ENCODER_FILENAME, "type": "ltxv", "device": "default"}},
+        "S1_clip":  {"class_type": "CLIPLoader",  "inputs": {"clip_name": actual_clip_name, "type": "ltxv", "device": "default"}},
         "S1_vvae":  {"class_type": "VAELoader",   "inputs": {"vae_name": VIDEO_VAE_FILENAME}},
         "S1_avae":  {"class_type": "VAELoader",   "inputs": {"vae_name": AUDIO_VAE_FILENAME}},
+    }
+
+    model_s1_ref = ["S1_unet", 0]
+    if use_distilled_lora:
+        actual_distilled = resolve_comfy_lora_name(DISTILLED_LORA_FILENAME, "LoraLoaderModelOnly")
+        wf["S1_distilled_lora"] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": ["S1_unet", 0], "lora_name": actual_distilled, "strength_model": float(distilled_lora_strength)},
+        }
+        model_s1_ref = ["S1_distilled_lora", 0]
+
+    wf.update({
         "S1_msr_loader": {
             "class_type": "ComfyUILTX25MSRICLoRALoader",
-            "inputs": {"model": ["S1_unet", 0], "lora_name": actual_msr_lora, "strength_model": float(msr_lora_strength)},
+            "inputs": {"model": model_s1_ref, "lora_name": actual_msr_lora, "strength_model": float(msr_lora_strength)},
         },
         "S1_neg_enc":     {"class_type": "CLIPTextEncode", "inputs": {"clip": ["S1_clip", 0], "text": negative_text}},
         "S1_width":       {"class_type": "INTConstant",    "inputs": {"value": half_w}},
@@ -475,7 +793,7 @@ def build_msr_workflow(
             },
         },
         "S1_ltxv_cond": {"class_type": "LTXVConditioning", "inputs": {"positive": ["S1_relay", 1], "negative": ["S1_neg_enc", 0], "frame_rate": ["S1_fps", 0]}},
-    }
+    })
 
     # MSR Guide Node
     msr_s1 = {
@@ -511,21 +829,34 @@ def build_msr_workflow(
         return wf
 
     # ---- Stage 2: Spatial Upscale x2 + Refiner ----
+    s2_model = ["S1_msr_loader", 0]
+    if use_refine_lora:
+        actual_refine = resolve_comfy_lora_name(REFINE_DETAILS_LORA_FILENAME, "LoraLoaderModelOnly")
+        wf["S2_refine_lora"] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": ["S1_msr_loader", 0], "lora_name": actual_refine, "strength_model": float(refine_lora_strength)},
+        }
+        s2_model = ["S2_refine_lora", 0]
+
     wf.update({
         "S2_upscale_loader": {"class_type": "LatentUpscaleModelLoader", "inputs": {"model_name": SPATIAL_UPSCALER_FILENAME}},
         "S2_upsampler":      {"class_type": "LTXVLatentUpsampler",       "inputs": {"samples": ["S1_crop_guides", 2], "upscale_model": ["S2_upscale_loader", 0], "vae": ["S1_vvae", 0]}},
         "S2_relay": {
             "class_type": "PromptRelayEncode",
             "inputs": {
-                "model": ["S1_msr_loader", 0], "clip": ["S1_clip", 0], "latent": ["S2_upsampler", 0],
+                "model": s2_model, "clip": ["S1_clip", 0], "latent": ["S2_upsampler", 0],
                 "global_prompt": prompt_relay_desc or "", "local_prompts": prompt_main,
                 "segment_lengths": "", "epsilon": 0.001,
             },
         },
+        "S2_ltxv_cond": {
+            "class_type": "LTXVConditioning",
+            "inputs": {"positive": ["S2_relay", 1], "negative": ["S1_neg_enc", 0], "frame_rate": ["S1_fps", 0]},
+        },
     })
 
     msr_s2 = {
-        "positive": ["S2_relay", 1], "negative": ["S1_neg_enc", 0],
+        "positive": ["S2_ltxv_cond", 0], "negative": ["S2_ltxv_cond", 1],
         "vae": ["S1_vvae", 0], "latent": ["S2_upsampler", 0],
         "msr_parameters": ["S1_msr_loader", 1],
         "strength": float(msr_strength), "reference_frames": str(reference_frames),
@@ -536,17 +867,16 @@ def build_msr_workflow(
             msr_s2[slot] = [f"S1_load_{slot}", 0]
     wf["S2_msr_guide"] = {"class_type": "ComfyUILTX25MSRMultiReferenceGuide", "inputs": msr_s2}
 
-    # Sửa logic Stage 2: Conditioning đúng chuẩn để guider nhận diện token chính xác
+    # Stage 2 Sampling & Decode: S2_crop_guides nhận trực tiếp conditioning từ S2_msr_guide để cắt sạch reference frames
     wf.update({
-        "S2_ltxv_cond":   {"class_type": "LTXVConditioning",      "inputs": {"positive": ["S2_msr_guide", 0], "negative": ["S2_msr_guide", 1], "frame_rate": ["S1_fps", 0]}},
         "S2_concat_av":   {"class_type": "LTXVConcatAVLatent",   "inputs": {"video_latent": ["S2_msr_guide", 2], "audio_latent": ["S1_sep_av", 1]}},
-        "S2_dual_guider": {"class_type": "LTXVDualCFGGuider",    "inputs": {"model": ["S2_relay", 0], "positive": ["S2_ltxv_cond", 0], "negative": ["S2_ltxv_cond", 1], "video_cfg": float(video_cfg), "audio_cfg": float(audio_cfg)}},
-        "S2_noise":       {"class_type": "RandomNoise",           "inputs": {"noise_seed": int(seed) + 1000}},
-        "S2_sampler_sel": {"class_type": "KSamplerSelect",        "inputs": {"sampler_name": "euler_ancestral"}},
+        "S2_dual_guider": {"class_type": "LTXVDualCFGGuider",    "inputs": {"model": ["S2_relay", 0], "positive": ["S2_msr_guide", 0], "negative": ["S2_msr_guide", 1], "video_cfg": float(video_cfg), "audio_cfg": float(audio_cfg)}},
+        "S2_noise":       {"class_type": "RandomNoise",           "inputs": {"noise_seed": int(seed)}},
+        "S2_sampler_sel": {"class_type": "KSamplerSelect",        "inputs": {"sampler_name": "euler"}},
         "S2_sigmas":      {"class_type": "ManualSigmas",          "inputs": {"sigmas": SIGMAS_PASS2}},
         "S2_sample":      {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["S2_noise", 0], "guider": ["S2_dual_guider", 0], "sampler": ["S2_sampler_sel", 0], "sigmas": ["S2_sigmas", 0], "latent_image": ["S2_concat_av", 0]}},
         "S2_sep_av":      {"class_type": "LTXVSeparateAVLatent",  "inputs": {"av_latent": ["S2_sample", 0]}},
-        "S2_crop_guides": {"class_type": "LTXVCropGuides",        "inputs": {"positive": ["S2_ltxv_cond", 0], "negative": ["S2_ltxv_cond", 1], "latent": ["S2_sep_av", 0]}},
+        "S2_crop_guides": {"class_type": "LTXVCropGuides",        "inputs": {"positive": ["S2_msr_guide", 0], "negative": ["S2_msr_guide", 1], "latent": ["S2_sep_av", 0]}},
         "S2_vae_tiled":   {"class_type": "VAEDecodeTiled",        "inputs": {"samples": ["S2_crop_guides", 2], "vae": ["S1_vvae", 0], "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 16}},
         "S2_aud_decode":  {"class_type": "LTXVAudioVAEDecode",   "inputs": {"samples": ["S2_sep_av", 1], "audio_vae": ["S1_avae", 0]}},
         "S2_create_vid":  {"class_type": "CreateVideo",           "inputs": {"images": ["S2_vae_tiled", 0], "audio": ["S2_aud_decode", 0], "fps": float(safe_fps)}},
@@ -568,26 +898,42 @@ def build_ingredients_workflow(
     height=544,
     fps=24,
     duration=5,
-    seed=None,
-    video_cfg=1.5,
+    seed=0,
+    video_cfg=1.1,
+    use_distilled_lora=False,
+    distilled_lora_strength=1.0,
+    text_encoder_name=None,
 ):
     if negative_prompt is None:
         negative_prompt = NEGATIVE_PROMPT_DEFAULT
     if seed is None:
-        seed = random.randint(1, 999_999_999)
+        seed = 0
 
     safe_fps = snap_fps_safe(fps)
     w, h = safe_dims(width, height)
     actual_ing_lora = resolve_comfy_lora_name(INGREDIENTS_LORA_FILENAME, "LTXICLoRALoaderModelOnly")
+    actual_clip_name = resolve_comfy_clip_name(text_encoder_name or TEXT_ENCODER_FILENAME)
 
     wf = {
         "unet":   {"class_type": "UNETLoader",  "inputs": {"unet_name": UNET_FILENAME, "weight_dtype": "default"}},
-        "clip":   {"class_type": "CLIPLoader",  "inputs": {"clip_name": TEXT_ENCODER_FILENAME, "type": "ltxv", "device": "default"}},
+        "clip":   {"class_type": "CLIPLoader",  "inputs": {"clip_name": actual_clip_name, "type": "ltxv", "device": "default"}},
         "vvae":   {"class_type": "VAELoader",   "inputs": {"vae_name": VIDEO_VAE_FILENAME}},
         "avae":   {"class_type": "VAELoader",   "inputs": {"vae_name": AUDIO_VAE_FILENAME}},
+    }
+
+    ing_model = ["unet", 0]
+    if use_distilled_lora:
+        actual_distilled = resolve_comfy_lora_name(DISTILLED_LORA_FILENAME, "LoraLoaderModelOnly")
+        wf["distilled_lora"] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": ["unet", 0], "lora_name": actual_distilled, "strength_model": float(distilled_lora_strength)},
+        }
+        ing_model = ["distilled_lora", 0]
+
+    wf.update({
         "ic_lora": {
             "class_type": "LTXICLoRALoaderModelOnly",
-            "inputs": {"model": ["unet", 0], "lora_name": actual_ing_lora, "strength_model": 1.0},
+            "inputs": {"model": ing_model, "lora_name": actual_ing_lora, "strength_model": 1.0},
         },
         "pos_enc": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["clip", 0], "text": positive_prompt}},
         "neg_enc": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["clip", 0], "text": negative_prompt}},
@@ -618,7 +964,7 @@ def build_ingredients_workflow(
         "adecode":   {"class_type": "LTXVAudioVAEDecode", "inputs": {"samples": ["sep_av", 1], "audio_vae": ["avae", 0]}},
         "make_vid":  {"class_type": "CreateVideo", "inputs": {"images": ["vdecode", 0], "audio": ["adecode", 0], "fps": float(safe_fps)}},
         "save":      {"class_type": "SaveVideo", "inputs": {"video": ["make_vid", 0], "filename_prefix": "output/LTX25_Ingredients", "format": "auto", "codec": "auto"}},
-    }
+    })
     return wf
 
 
@@ -634,20 +980,26 @@ def build_cinema_workflow(
     height=720,
     fps=24,
     duration=5,
-    seed=None,
-    video_cfg=1.5,
+    seed=0,
+    video_cfg=1.1,
+    use_distilled_lora=False,
+    distilled_lora_strength=1.0,
+    text_encoder_name=None,
+    use_refine_lora=True,
+    refine_lora_strength=0.6,
 ):
     if negative_prompt is None:
         negative_prompt = NEGATIVE_PROMPT_DEFAULT
     if seed is None:
-        seed = random.randint(1, 999_999_999)
+        seed = 0
 
     safe_fps = snap_fps_safe(fps)
     half_w, half_h = half_dims(width, height)
+    actual_clip_name = resolve_comfy_clip_name(text_encoder_name or TEXT_ENCODER_FILENAME)
 
     wf = {
         "unet":   {"class_type": "UNETLoader",  "inputs": {"unet_name": UNET_FILENAME, "weight_dtype": "default"}},
-        "clip":   {"class_type": "CLIPLoader",  "inputs": {"clip_name": TEXT_ENCODER_FILENAME, "type": "ltxv", "device": "default"}},
+        "clip":   {"class_type": "CLIPLoader",  "inputs": {"clip_name": actual_clip_name, "type": "ltxv", "device": "default"}},
         "vvae":   {"class_type": "VAELoader",   "inputs": {"vae_name": VIDEO_VAE_FILENAME}},
         "avae":   {"class_type": "VAELoader",   "inputs": {"vae_name": AUDIO_VAE_FILENAME}},
         "pos_enc": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["clip", 0], "text": positive_prompt}},
@@ -659,6 +1011,15 @@ def build_cinema_workflow(
         "empty_aud": {"class_type": "LTXVEmptyLatentAudio", "inputs": {"audio_vae": ["avae", 0], "frames_number": ["frames_expr", 1], "frame_rate": ["fps_c", 0], "batch_size": 1}},
     }
 
+    cinema_model = ["unet", 0]
+    if use_distilled_lora:
+        actual_distilled = resolve_comfy_lora_name(DISTILLED_LORA_FILENAME, "LoraLoaderModelOnly")
+        wf["distilled_lora"] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": ["unet", 0], "lora_name": actual_distilled, "strength_model": float(distilled_lora_strength)},
+        }
+        cinema_model = ["distilled_lora", 0]
+
     # Start Frame (I2V)
     vid_latent_node = ["empty_vid", 0]
     if start_frame_name:
@@ -668,20 +1029,36 @@ def build_cinema_workflow(
 
     wf.update({
         "concat_av":   {"class_type": "LTXVConcatAVLatent", "inputs": {"video_latent": vid_latent_node, "audio_latent": ["empty_aud", 0]}},
-        "guider":      {"class_type": "CFGGuider", "inputs": {"model": ["unet", 0], "positive": ["cond", 0], "negative": ["cond", 1], "cfg": float(video_cfg)}},
+        "guider":      {"class_type": "CFGGuider", "inputs": {"model": cinema_model, "positive": ["cond", 0], "negative": ["cond", 1], "cfg": float(video_cfg)}},
         "noise":       {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed)}},
         "sampler_sel": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler_ancestral"}},
         "sigmas":      {"class_type": "ManualSigmas", "inputs": {"sigmas": SIGMAS_PASS1}},
         "sample":      {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["noise", 0], "guider": ["guider", 0], "sampler": ["sampler_sel", 0], "sigmas": ["sigmas", 0], "latent_image": ["concat_av", 0]}},
         "sep_av":      {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["sample", 0]}},
+    })
 
+    s2_guider = ["guider", 0]
+    if use_refine_lora:
+        actual_refine = resolve_comfy_lora_name(REFINE_DETAILS_LORA_FILENAME, "LoraLoaderModelOnly")
+        wf["s2_refine_lora"] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": cinema_model, "lora_name": actual_refine, "strength_model": float(refine_lora_strength)},
+        }
+        wf["s2_guider"] = {
+            "class_type": "CFGGuider",
+            "inputs": {"model": ["s2_refine_lora", 0], "positive": ["cond", 0], "negative": ["cond", 1], "cfg": float(video_cfg)},
+        }
+        s2_guider = ["s2_guider", 0]
+
+    wf.update({
         # Stage 2: Spatial Upscale x2
         "upscale_loader": {"class_type": "LatentUpscaleModelLoader", "inputs": {"model_name": SPATIAL_UPSCALER_FILENAME}},
         "upsampler":      {"class_type": "LTXVLatentUpsampler", "inputs": {"samples": ["sep_av", 0], "upscale_model": ["upscale_loader", 0], "vae": ["vvae", 0]}},
         "s2_concat_av":   {"class_type": "LTXVConcatAVLatent", "inputs": {"video_latent": ["upsampler", 0], "audio_latent": ["sep_av", 1]}},
-        "s2_noise":       {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed) + 1000}},
+        "s2_noise":       {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed)}},
+        "s2_sampler_sel": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
         "s2_sigmas":      {"class_type": "ManualSigmas", "inputs": {"sigmas": SIGMAS_PASS2}},
-        "s2_sample":      {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["s2_noise", 0], "guider": ["guider", 0], "sampler": ["sampler_sel", 0], "sigmas": ["s2_sigmas", 0], "latent_image": ["s2_concat_av", 0]}},
+        "s2_sample":      {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["s2_noise", 0], "guider": s2_guider, "sampler": ["s2_sampler_sel", 0], "sigmas": ["s2_sigmas", 0], "latent_image": ["s2_concat_av", 0]}},
         "s2_sep_av":      {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["s2_sample", 0]}},
         "vdecode":        {"class_type": "VAEDecodeTiled", "inputs": {"samples": ["s2_sep_av", 0], "vae": ["vvae", 0], "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 16}},
         "adecode":        {"class_type": "LTXVAudioVAEDecode", "inputs": {"samples": ["s2_sep_av", 1], "audio_vae": ["avae", 0]}},
@@ -698,8 +1075,11 @@ def studio_generate_gradio(
     studio_mode,
     pic1_path, pic2_path, pic3_path, pic4_path, bg_path, start_frame_path, ingredients_sheet_path,
     prompt_relay_desc, prompt_main, negative_text,
-    aspect_ratio, v_length, v_fps, v_seed, num_segments, fixed_seed,
-    video_cfg, msr_strength, reference_frames, run_stage2, low_vram, use_quality_wrap,
+    aspect_ratio, v_length, v_fps, v_seed=0, num_segments=1, fixed_seed=True,
+    video_cfg=1.1, msr_strength=0.7, reference_frames="33", run_stage2=True, low_vram=True, use_quality_wrap=True,
+    use_distilled_lora=False, distilled_lora_strength=1.0,
+    text_encoder_choice="gemma4-12b-with-proj-ltx-2.5-bf16.safetensors (BF16 Chuẩn cao cấp)",
+    use_refine_lora=True, refine_lora_strength=0.6,
 ):
     prompts = split_prompts(prompt_main)
     if not prompts:
@@ -708,6 +1088,17 @@ def studio_generate_gradio(
 
     v_width, v_height = parse_aspect_ratio(aspect_ratio)
     safe_width, safe_height = safe_dims(v_width, v_height)
+
+    yield None, None, "⬇️ Đang kiểm tra / chuẩn bị Text Encoder (Gemma 4 12B)..."
+    active_clip = ensure_text_encoder(text_encoder_choice)
+
+    if use_distilled_lora:
+        yield None, None, "⬇️ Đang kiểm tra / tải Official Distilled LoRA 450 (ltx-2.5-22b-distilled-lora-450-bf16)..."
+        ensure_distilled_lora()
+
+    if run_stage2 and use_refine_lora:
+        yield None, None, "⬇️ Đang kiểm tra / tải Refine Details LoRA (ltx-2.5-22b-ic-lora-refine-details-1.0)..."
+        ensure_refine_details_lora()
 
     yield None, None, "🔄 Đang kiểm tra / đánh thức ComfyUI server..."
     try:
@@ -737,9 +1128,10 @@ def studio_generate_gradio(
     total_scenes  = len(scene_prompts)
     total_secs    = total_scenes * int(v_length)
 
+    refine_status = f"Bật ({refine_lora_strength})" if (run_stage2 and use_refine_lora) else "Tắt"
     yield None, None, (
         f"✅ Server sẵn sàng. Bắt đầu sản xuất {total_scenes} phân cảnh ({total_secs}s tổng).\n"
-        f"🎬 Chế độ: {studio_mode} · Seed gốc: {base_seed} · CFG: {video_cfg}"
+        f"🎬 Chế độ: {studio_mode} · Text Encoder: {active_clip} · Refine Details: {refine_status} · Distilled LoRA: {'Bật' if use_distilled_lora else 'Tắt'}"
     )
 
     generated_videos = []
@@ -760,7 +1152,7 @@ def studio_generate_gradio(
                 fps               = v_fps,
                 duration          = v_length,
                 seed              = seed_i,
-                video_cfg         = float(video_cfg or 1.5),
+                video_cfg         = float(video_cfg or 1.1),
                 pic1_name         = pic1_name,
                 pic2_name         = pic2_name,
                 pic3_name         = pic3_name,
@@ -770,6 +1162,11 @@ def studio_generate_gradio(
                 msr_strength      = msr_strength,
                 reference_frames  = str(reference_frames),
                 run_stage2        = bool(run_stage2),
+                use_distilled_lora = bool(use_distilled_lora),
+                distilled_lora_strength = float(distilled_lora_strength or 1.0),
+                text_encoder_name = active_clip,
+                use_refine_lora   = bool(use_refine_lora),
+                refine_lora_strength = float(refine_lora_strength or 0.6),
             )
         elif "Ingredients" in studio_mode:
             if not sheet_name:
@@ -784,7 +1181,10 @@ def studio_generate_gradio(
                 fps              = v_fps,
                 duration         = v_length,
                 seed             = seed_i,
-                video_cfg        = float(video_cfg or 1.5),
+                video_cfg        = float(video_cfg or 1.1),
+                use_distilled_lora = bool(use_distilled_lora),
+                distilled_lora_strength = float(distilled_lora_strength or 1.0),
+                text_encoder_name = active_clip,
             )
         else: # Cinema Two-Stage
             wf = build_cinema_workflow(
@@ -796,7 +1196,12 @@ def studio_generate_gradio(
                 fps              = v_fps,
                 duration         = v_length,
                 seed             = seed_i,
-                video_cfg        = float(video_cfg or 1.5),
+                video_cfg        = float(video_cfg or 1.1),
+                use_distilled_lora = bool(use_distilled_lora),
+                distilled_lora_strength = float(distilled_lora_strength or 1.0),
+                text_encoder_name = active_clip,
+                use_refine_lora   = bool(use_refine_lora),
+                refine_lora_strength = float(refine_lora_strength or 0.6),
             )
 
         timeout = max(600, int(v_length) * 200)
@@ -946,21 +1351,51 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple"
                     value="16:9 (1280x720) · HD 720p Ngang",
                     label="Tỷ lệ khung hình"
                 )
-                duration_in = gr.Slider(minimum=3, maximum=15, value=5, step=1, label="Thời lượng mỗi cảnh (giây)")
+                duration_in = gr.Slider(minimum=3, maximum=15, value=8, step=1, label="Thời lượng mỗi cảnh (giây)")
                 fps_in      = gr.Slider(minimum=24, maximum=30, value=24, step=6, label="Tốc độ khung hình (24fps chuẩn điện ảnh)")
 
             with gr.Row():
-                seed_in     = gr.Number(value=-1, label="Seed (-1 để ngẫu nhiên)", precision=0)
+                seed_in     = gr.Number(value=0, label="Seed (Mặc định: 0, -1 để ngẫu nhiên)", precision=0)
                 segments_in = gr.Slider(minimum=1, maximum=10, value=1, step=1, label="Số phân cảnh lặp (nếu chỉ 1 prompt)")
-                fixed_seed_in = gr.Checkbox(label="Cố định Seed cho mọi cảnh", value=False)
+                fixed_seed_in = gr.Checkbox(label="Cố định Seed cho mọi cảnh", value=True)
 
             with gr.Accordion("⚙️ Tùy chỉnh nâng cao & Bộ nhớ", open=False):
-                cfg_in = gr.Slider(minimum=1.0, maximum=3.0, value=1.5, step=0.1, label="Video CFG Scale")
+                cfg_in = gr.Slider(minimum=1.0, maximum=3.0, value=1.1, step=0.1, label="Video CFG Scale", info="Khuyên dùng 1.0 - 1.2 cho model Distilled để tránh cháy sáng / bóng dầu")
                 msr_str_in = gr.Slider(minimum=0.1, maximum=1.0, value=0.7, step=0.05, label="MSR Reference Strength")
                 ref_frames_in = gr.Dropdown(choices=["17", "33", "49"], value="33", label="Số Frame tham chiếu MSR")
                 stage2_in  = gr.Checkbox(label="Chạy Stage 2 (x2 Spatial Upscale + Refiner)", value=True)
                 lowvram_in = gr.Checkbox(label="Low VRAM Mode (Bật khi dùng GPU ≤16GB)", value=True)
-                wrap_in    = gr.Checkbox(label="Tự động thêm tiền tố/hậu tố chất lượng điện ảnh", value=True)
+                wrap_in    = gr.Checkbox(label="Tự động thêm tiền tố/hậu tố chất lượng điện ảnh (Matte Film Look)", value=True)
+                with gr.Row():
+                    text_encoder_in = gr.Dropdown(
+                        choices=[
+                            "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors (BF16 Chuẩn cao cấp)",
+                            "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors (INT8 Tiết kiệm VRAM)",
+                        ],
+                        value="gemma4-12b-with-proj-ltx-2.5-bf16.safetensors (BF16 Chuẩn cao cấp)",
+                        label="🔤 Text Encoder (Gemma 4 12B with Projection)",
+                        info="BF16: Khả năng diễn giải prompt và chi tiết tối đa | INT8: Tiết kiệm ~12GB VRAM/RAM cho GPU ≤16GB"
+                    )
+                with gr.Row():
+                    refine_lora_in = gr.Checkbox(
+                        label="✨ Dùng Refine Details LoRA ở Stage 2 (ltx-2.5-22b-ic-lora-refine-details-1.0)",
+                        value=True,
+                        info="LoRA chính thức tinh chỉnh siêu nét chi tiết da mặt, sợi tóc, texture cho Stage 2 Refiner."
+                    )
+                    refine_lora_str_in = gr.Slider(
+                        minimum=0.1, maximum=1.0, value=0.6, step=0.05,
+                        label="Độ mạnh Refine Details LoRA (Khuyên dùng 0.5 - 0.6)"
+                    )
+                with gr.Row():
+                    distilled_lora_in = gr.Checkbox(
+                        label="⚡ Dùng Official Distilled LoRA 450 (ltx-2.5-22b-distilled-lora-450-bf16)",
+                        value=False,
+                        info="LoRA gia tốc chính thức từ Lightricks (450 steps). Tự động tải nếu chưa có."
+                    )
+                    distilled_lora_str_in = gr.Slider(
+                        minimum=0.1, maximum=1.0, value=1.0, step=0.05,
+                        label="Độ mạnh Distilled LoRA (Strength)"
+                    )
 
             with gr.Row():
                 generate_btn = gr.Button("🎬 Bắt đầu sản xuất phim", variant="primary", scale=3, size="lg")
@@ -990,6 +1425,9 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple"
             prompt_relay_in, prompt_main_in, neg_prompt_in,
             aspect_in, duration_in, fps_in, seed_in, segments_in, fixed_seed_in,
             cfg_in, msr_str_in, ref_frames_in, stage2_in, lowvram_in, wrap_in,
+            distilled_lora_in, distilled_lora_str_in,
+            text_encoder_in,
+            refine_lora_in, refine_lora_str_in,
         ],
         outputs=[gallery_out, final_video_out, status_box]
     )
@@ -1003,20 +1441,29 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple"
 # ==============================================================================
 # KHỞI CHẠY LIVE (TỰ ĐỘNG KẾT NỐI VÀ MỞ LINK GRADIO.LIVE)
 # ==============================================================================
-print("🔄 Khởi động ComfyUI server (LTX-2.5 Cinema Studio)...")
-try:
-    ensure_server(low_vram=True)
-    print("🟢 ComfyUI server sẵn sàng!")
-except Exception as e:
-    print(f"⚠️ {e}")
+if __name__ == "__main__":
+    import sys
+    if sys.platform.startswith("win"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
-demo.queue()
-demo.launch(
-    share=True,
-    inline=False,
-    debug=True,
-    theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple", neutral_hue="slate"),
-    css=custom_css,
-    js=notification_js,
-)
+    print("🔄 Khởi động ComfyUI server (LTX-2.5 Cinema Studio)...")
+    try:
+        ensure_server(low_vram=True)
+        print("🟢 ComfyUI server sẵn sàng!")
+    except Exception as e:
+        print(f"⚠️ {e}")
+
+    demo.queue()
+    demo.launch(
+        share=True,
+        inline=False,
+        debug=True,
+        theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple", neutral_hue="slate"),
+        css=custom_css,
+        js=notification_js,
+    )
 
