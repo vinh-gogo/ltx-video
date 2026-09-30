@@ -1,0 +1,18 @@
+# Project Intelligence & Memory Bank Rules (.clinerules)
+
+This repository uses a structured **Memory Bank** located in `memory-bank/` to maintain continuity, technical decisions, and architecture across development sessions.
+
+## 1. Memory Bank Structure & Purpose
+- `memory-bank/projectbrief.md`: Foundation document defining core scope, targets, and deliverables.
+- `memory-bank/productContext.md`: Problems solved, user personas, and target workflows.
+- `memory-bank/techContext.md`: Tech stack, hardware constraints, dependencies, and environment configurations.
+- `memory-bank/systemPatterns.md`: System architecture, workflow mutation patterns, and module separation rules.
+- `memory-bank/activeContext.md`: Current active focus, recent changes, and immediate next steps.
+- `memory-bank/progress.md`: Completed features, test milestones, and upcoming roadmap items.
+
+## 2. Core Operational Constraints
+- **Cell Isolation:** Keep `download.py` (Cell 1), `minimax.py`/`ltx2_5.py` (Cell 2), and `rife_postprocess.py` (Cell 3) isolated in concerns and dependencies.
+- **Port Management:** Always perform health-checks on port 8188 and properly terminate stale ComfyUI processes before restarting.
+- **VRAM Safeguards:** Use `PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"`, VAE `int8_convrot`, and Qwen3-VL in `int8`/`fp4 AWQ`.
+- **Gradio Compatibility:** Ensure all UI code remains compatible with Gradio 6.0+.
+- **Audio Integrity:** When using RIFE post-processing, always extract and remux the original stereo audio with `-c:a copy` to preserve timing and synchronization.

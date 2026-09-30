@@ -2,7 +2,7 @@
   "id": "14519cfe-6497-4ab1-a02f-82296373ce6f",
   "revision": 2,
   "last_node_id": 129,
-  "last_link_id": 417,
+  "last_link_id": 418,
   "nodes": [
     {
       "id": 25,
@@ -173,7 +173,8 @@
           "name": "Audio",
           "type": "AUDIO",
           "links": [
-            325
+            325,
+            418
           ]
         }
       ],
@@ -1498,7 +1499,7 @@
         }
       },
       "widgets_values": [
-        30.000000000000007
+        24.0
       ],
       "color": "#232",
       "bgcolor": "#353"
@@ -3450,7 +3451,7 @@
         "widget_ue_connectable": {}
       },
       "widgets_values": [
-        "euler"
+        "euler_ancestral"
       ]
     },
     {
@@ -3998,7 +3999,7 @@
           "name": "audio",
           "shape": 7,
           "type": "AUDIO",
-          "link": null
+          "link": 418
         },
         {
           "label": "meta_batch",
@@ -4188,7 +4189,7 @@
         "tabXOffset": 10
       },
       "widgets_values": [
-        "euler"
+        "euler_ancestral"
       ]
     }
   ],
@@ -4968,6 +4969,14 @@
       16,
       3,
       "SIGMAS"
+    ],
+    [
+      418,
+      87,
+      0,
+      128,
+      1,
+      "AUDIO"
     ]
   ],
   "groups": [
