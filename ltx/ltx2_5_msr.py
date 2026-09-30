@@ -40,12 +40,14 @@ TEXT_ENCODER_FILENAME     = globals().get("TEXT_ENCODER_FILENAME",     TEXT_ENCO
 VIDEO_VAE_FILENAME        = globals().get("VIDEO_VAE_FILENAME",        "ltx-2.5-video-vae-bf16.safetensors")
 AUDIO_VAE_FILENAME        = globals().get("AUDIO_VAE_FILENAME",        "ltx-2.5-audio-vae-bf16.safetensors")
 SPATIAL_UPSCALER_FILENAME = globals().get("SPATIAL_UPSCALER_FILENAME", "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors")
+SPATIAL_UPSCALER_URL      = "https://huggingface.co/Lightricks/LTX-2.5/resolve/main/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
 MSR_LORA_FILENAME         = globals().get("MSR_LORA_FILENAME",         "ltx2.5/LTX-2.5-Licon-MSR-V1.safetensors")
 INGREDIENTS_LORA_FILENAME = globals().get("INGREDIENTS_LORA_FILENAME", "ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors")
 DISTILLED_LORA_FILENAME   = globals().get("DISTILLED_LORA_FILENAME",   "ltx-2.5-22b-distilled-lora-450-bf16.safetensors")
 DISTILLED_LORA_URL        = "https://huggingface.co/Lightricks/LTX-2.5/resolve/main/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
 REFINE_DETAILS_LORA_FILENAME = globals().get("REFINE_DETAILS_LORA_FILENAME", "ltx-2.5-22b-ic-lora-refine-details-1.0.safetensors")
 REFINE_DETAILS_LORA_URL      = "https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Refine-Details/resolve/main/ltx-2.5-22b-ic-lora-refine-details-1.0.safetensors"
+
 
 LATENT_GROUP_FRAMES = 8
 
@@ -254,6 +256,92 @@ def apply_quality_wrapping(prompt, use_wrap=True):
     return f"{QUALITY_PREFIX}{p}{QUALITY_SUFFIX}"
 
 
+def clean_visual_prompt_for_relay(prompt):
+    """
+    1. Cắt bỏ Audio / Sound / Voiceover / Lời thoại / Speech transcripts ra khỏi prompt thị giác.
+    2. Chuyển đổi các cú máy 2 shot (vd: First 4 seconds ... At precisely 4 seconds ...) thành cú pháp nhịp 'Shot 1 | Shot 2' cho PromptRelayEncode.
+    """
+    if not prompt or not prompt.strip():
+        return ""
+    p = prompt.strip()
+
+    # Cắt bỏ Audio / Voiceover / Lời thoại / Thuyết minh / 旁白 / 音频
+    p = re.split(r"(?i)\b(?:Audio|Sound effects|SFX|Voiceover|Narration|Lời thoại|Thuyết minh)\s*[:：]|(?:旁白|音频|音效)\s*[:：]", p)[0].strip()
+
+    # Xóa các chuỗi lời thoại còn sót: [00:00-00:04] "..."
+    p = re.sub(r'\[\d{2}:\d{2}\s*-\s*\d{2}:\d{2}\][^"\u201c\n]*["\u201c][^"\u201d]*["\u201d]', '', p).strip()
+
+    # Nhận diện điểm chuyển cảnh (Giây thứ 4 hoặc giữa 2 shot)
+    split_pattern = r"(?i)(?:[,\.，。\s]+)(?:At precisely (?:4 seconds|00:04)|At 4 seconds|Chuyển cảnh (?:tại |ở |\(|\:)?00:04\)?|后4秒[：:]?|第4秒[：:]?)[,\s:：]*"
+    parts = re.split(split_pattern, p, maxsplit=1)
+
+    if len(parts) == 2:
+        shot1 = parts[0].strip()
+        shot2 = parts[1].strip()
+        shot1 = re.sub(r"(?i)\b(?:First 4 seconds|前4秒)\s*[:：]\s*", "", shot1).strip()
+        return f"{shot1} | {shot2}"
+
+    return p
+
+
+def format_msr_actor_descriptions(text, active_slots=None):
+    """
+    Chuẩn hóa mô tả các Act & Background:
+    - Mỗi mô tả cách nhau bằng 1 dòng trống (\\n\\n).
+    - Tự động gắn nhãn Image 1:, Image 2:, Image 3:, Image 4:, Background: nếu chưa có.
+    - Lọc chỉ giữ lại mô tả của các Act thực sự xuất hiện trong phân cảnh hiện tại.
+    """
+    if not text or not text.strip():
+        return ""
+    blocks = [b.strip() for b in re.split(r"\n[ \t]*\n+", text.strip()) if b.strip()]
+    formatted = []
+    default_tags = ["Image 1: ", "Image 2: ", "Image 3: ", "Image 4: ", "Background: "]
+    slot_keys = ["pic1", "pic2", "pic3", "pic4", "bg"]
+
+    for i, b in enumerate(blocks):
+        slot_key = slot_keys[i] if i < len(slot_keys) else f"pic{i+1}"
+        if active_slots and not active_slots.get(slot_key, True):
+            continue
+        if re.match(r"^(?:Image\s*\d+|Pic\s*\d+|Background|Act\s*\d+)[\s*:\-]", b, re.IGNORECASE):
+            formatted.append(b)
+        else:
+            tag = default_tags[i] if i < len(default_tags) else f"Image {i+1}: "
+            formatted.append(f"{tag}{b}")
+    return "\n\n".join(formatted)
+
+
+def detect_active_actors_for_scene(prompt, relay_desc=""):
+    """
+    Tự động nhận diện những Act nào xuất hiện trong phân cảnh để chỉ nạp slot ảnh đó.
+    Ngăn chặn việc các nhân vật khác bị ép vào sai phân cảnh (vd: Cáo và Sói bị ép vào Cảnh 1).
+    """
+    p_lower = prompt.lower()
+    patterns = {
+        "pic1": [r"\bimage\s*1\b", r"\bpic\s*1\b", r"\bact\s*1\b", r"kuro", r"mèo", r"cat", r"lạc phong", r"strategist", r"tom cat", r"tomcat", r"feline", r"黑猫", r"骆峰"],
+        "pic2": [r"\bimage\s*2\b", r"\bpic\s*2\b", r"\bact\s*2\b", r"aria", r"cáo", r"fox", r"hồ ly", r"nine-tailed", r"cửu vĩ", r"狐狸", r"阿莉亚", r"九尾"],
+        "pic3": [r"\bimage\s*3\b", r"\bpic\s*3\b", r"\bact\s*3\b", r"fenris", r"sói", r"wolf", r"wolves", r"frost wolf", r"cự lang", r"狼", r"芬里斯"],
+        "pic4": [r"\bimage\s*4\b", r"\bpic\s*4\b", r"\bact\s*4\b", r"balthazar", r"sư tử", r"lion", r"iron lion", r"magitech lion", r"巴尔萨泽", r"狮子"],
+    }
+
+    if relay_desc and relay_desc.strip():
+        blocks = [b.strip() for b in re.split(r"\n[ \t]*\n+", relay_desc.strip()) if b.strip()]
+        slot_keys = ["pic1", "pic2", "pic3", "pic4"]
+        for i, b in enumerate(blocks[:4]):
+            words = re.findall(r"[\w\u00C0-\u1EF9]+", b)
+            keywords = [w.lower() for w in words if len(w) >= 4 and w.lower() not in ["image", "bối", "cảnh", "nhân", "vật"]]
+            patterns[slot_keys[i]].extend([rf"\b{re.escape(k)}\b" for k in keywords[:5]])
+
+    active = {}
+    for slot, kws in patterns.items():
+        active[slot] = any(re.search(kw, p_lower) for kw in kws)
+
+    # Nếu không match slot nào, mặc định nạp Act 1 (nhân vật chính)
+    if not any(active.values()):
+        active["pic1"] = True
+    active["bg"] = True
+    return active
+
+
 def is_reference_sheet_prompt(text):
     lower = text.lower()
     ref_kw = [
@@ -340,6 +428,88 @@ def ensure_lora_symlinks():
         pass
 
 
+def _get_hf_token():
+    """Lấy HF_TOKEN từ biến môi trường hoặc Colab Secrets."""
+    tok = os.environ.get("HF_TOKEN", "")
+    if not tok:
+        try:
+            from google.colab import userdata
+            tok = userdata.get("HF_TOKEN") or ""
+        except Exception:
+            pass
+    return tok
+
+
+def ensure_upscaler_symlinks():
+    """Đồng bộ symlink giữa models/latent_upscale_models/ và models/upscale_models/."""
+    try:
+        lu_dir = os.path.join(COMFYUI_DIR, "models", "latent_upscale_models")
+        u_dir = os.path.join(COMFYUI_DIR, "models", "upscale_models")
+        os.makedirs(lu_dir, exist_ok=True)
+        os.makedirs(u_dir, exist_ok=True)
+        src = os.path.join(lu_dir, SPATIAL_UPSCALER_FILENAME)
+        dst = os.path.join(u_dir, SPATIAL_UPSCALER_FILENAME)
+        if os.path.exists(src) and not os.path.exists(dst):
+            try: os.symlink(src, dst)
+            except Exception: shutil.copy2(src, dst)
+        elif os.path.exists(dst) and not os.path.exists(src):
+            try: os.symlink(dst, src)
+            except Exception: shutil.copy2(dst, src)
+    except Exception:
+        pass
+
+
+def ensure_spatial_upscaler():
+    """Tự động kiểm tra và tải Spatial Upscaler x2 (ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors) nếu chưa có."""
+    upscale_dir = os.path.join(COMFYUI_DIR, "models", "latent_upscale_models")
+    os.makedirs(upscale_dir, exist_ok=True)
+    target = os.path.join(upscale_dir, SPATIAL_UPSCALER_FILENAME)
+    if os.path.exists(target) and os.path.getsize(target) > 1024 * 1024 * 5:
+        ensure_upscaler_symlinks()
+        return True
+
+    hf_token = _get_hf_token()
+    header = ["--header", f"Authorization: Bearer {hf_token}"] if hf_token else []
+    cmd = [
+        "aria2c", "--console-log-level=warn", "-c",
+        "-x", "8", "-s", "8", "-k", "1M",
+        "-d", upscale_dir, "-o", SPATIAL_UPSCALER_FILENAME,
+    ] + header + [SPATIAL_UPSCALER_URL]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True)
+    except Exception:
+        pass
+
+    if not (os.path.exists(target) and os.path.getsize(target) > 1024 * 1024 * 5):
+        try:
+            from huggingface_hub import hf_hub_download
+            hf_hub_download(
+                repo_id="Lightricks/LTX-2.5",
+                filename=f"latent_upscale_models/{SPATIAL_UPSCALER_FILENAME}",
+                local_dir=upscale_dir,
+                token=hf_token or None,
+            )
+            downloaded = os.path.join(upscale_dir, "latent_upscale_models", SPATIAL_UPSCALER_FILENAME)
+            if os.path.exists(downloaded) and not os.path.exists(target):
+                shutil.move(downloaded, target)
+        except Exception:
+            try:
+                import urllib.request
+                req = urllib.request.Request(SPATIAL_UPSCALER_URL, headers={"User-Agent": "Mozilla/5.0"})
+                if hf_token:
+                    req.add_header("Authorization", f"Bearer {hf_token}")
+                with urllib.request.urlopen(req, timeout=120) as resp, open(target, "wb") as f:
+                    shutil.copyfileobj(resp, f)
+            except Exception:
+                pass
+
+    ensure_upscaler_symlinks()
+    ok = os.path.exists(target) and os.path.getsize(target) > 1024 * 1024 * 5
+    if not ok:
+        print("⚠️ Chú ý: Chưa tải được Spatial Upscaler x2. Vui lòng cấp quyền HuggingFace token!")
+    return ok
+
+
 def ensure_distilled_lora():
     """Tự động tải ltx-2.5-22b-distilled-lora-450-bf16.safetensors nếu chưa có."""
     lora_dir = os.path.join(COMFYUI_DIR, "models", "loras")
@@ -348,7 +518,7 @@ def ensure_distilled_lora():
     if os.path.exists(target) and os.path.getsize(target) > 1024 * 1024 * 10:
         return True
 
-    hf_token = os.environ.get("HF_TOKEN", "")
+    hf_token = _get_hf_token()
     header = ["--header", f"Authorization: Bearer {hf_token}"] if hf_token else []
     cmd = [
         "aria2c", "--console-log-level=warn", "-c",
@@ -393,9 +563,10 @@ def ensure_refine_details_lora():
     os.makedirs(lora_dir, exist_ok=True)
     target = os.path.join(lora_dir, REFINE_DETAILS_LORA_FILENAME)
     if os.path.exists(target) and os.path.getsize(target) > 1024 * 1024 * 10:
+        ensure_lora_symlinks()
         return True
 
-    hf_token = os.environ.get("HF_TOKEN", "")
+    hf_token = _get_hf_token()
     header = ["--header", f"Authorization: Bearer {hf_token}"] if hf_token else []
     cmd = [
         "aria2c", "--console-log-level=warn", "-c",
@@ -431,7 +602,10 @@ def ensure_refine_details_lora():
                 pass
 
     ensure_lora_symlinks()
-    return os.path.exists(target) and os.path.getsize(target) > 1024 * 1024 * 10
+    ok = os.path.exists(target) and os.path.getsize(target) > 1024 * 1024 * 10
+    if not ok:
+        print("⚠️ Chú ý: Chưa tải được Refine Details LoRA. Đảm bảo đã bấm 'Agree' tại https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Refine-Details và cấp quyền HF_TOKEN!")
+    return ok
 
 
 def resolve_comfy_lora_name(target_name, class_type="ComfyUILTX25MSRICLoRALoader"):
@@ -535,7 +709,7 @@ def ensure_text_encoder(filename=None):
         else TEXT_ENCODER_INT8_URL
     )
 
-    hf_token = os.environ.get("HF_TOKEN", "")
+    hf_token = _get_hf_token()
     header = ["--header", f"Authorization: Bearer {hf_token}"] if hf_token else []
     cmd = [
         "aria2c", "--console-log-level=warn", "-c",
@@ -614,7 +788,11 @@ def resolve_comfy_clip_name(target_name=None):
     return clean_target
 
 
-def find_latest_video():
+def find_latest_video(preferred_prefix=None):
+    if preferred_prefix:
+        mp4_files = glob.glob(f"{OUTPUT_DIR}**/*{preferred_prefix}*.mp4", recursive=True)
+        if mp4_files:
+            return max(mp4_files, key=os.path.getmtime)
     mp4_files = glob.glob(f"{OUTPUT_DIR}**/*.mp4", recursive=True)
     if not mp4_files:
         return None
@@ -1073,13 +1251,14 @@ def build_cinema_workflow(
 # ==============================================================================
 def studio_generate_gradio(
     studio_mode,
-    pic1_path, pic2_path, pic3_path, pic4_path, bg_path, start_frame_path, ingredients_sheet_path,
+    act1_path, act2_path, act3_path, act4_path, bg_path,
     prompt_relay_desc, prompt_main, negative_text,
     aspect_ratio, v_length, v_fps, v_seed=0, num_segments=1, fixed_seed=True,
     video_cfg=1.1, msr_strength=0.7, reference_frames="33", run_stage2=True, low_vram=True, use_quality_wrap=True,
     use_distilled_lora=False, distilled_lora_strength=1.0,
     text_encoder_choice="gemma4-12b-with-proj-ltx-2.5-bf16.safetensors (BF16 Chuẩn cao cấp)",
     use_refine_lora=True, refine_lora_strength=0.6,
+    smart_actor_filter=True,
 ):
     prompts = split_prompts(prompt_main)
     if not prompts:
@@ -1089,16 +1268,19 @@ def studio_generate_gradio(
     v_width, v_height = parse_aspect_ratio(aspect_ratio)
     safe_width, safe_height = safe_dims(v_width, v_height)
 
-    yield None, None, "⬇️ Đang kiểm tra / chuẩn bị Text Encoder (Gemma 4 12B)..."
+    yield None, None, f"⬇️ Đang kiểm tra / nạp Text Encoder ({text_encoder_choice.split()[0]})..."
     active_clip = ensure_text_encoder(text_encoder_choice)
+
+    if run_stage2:
+        yield None, None, "⬇️ Đang kiểm tra / nạp Spatial Upscaler x2 (ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0)..."
+        ensure_spatial_upscaler()
+        if use_refine_lora:
+            yield None, None, "⬇️ Đang kiểm tra / nạp Refine Details LoRA (ltx-2.5-22b-ic-lora-refine-details-1.0)..."
+            ensure_refine_details_lora()
 
     if use_distilled_lora:
         yield None, None, "⬇️ Đang kiểm tra / tải Official Distilled LoRA 450 (ltx-2.5-22b-distilled-lora-450-bf16)..."
         ensure_distilled_lora()
-
-    if run_stage2 and use_refine_lora:
-        yield None, None, "⬇️ Đang kiểm tra / tải Refine Details LoRA (ltx-2.5-22b-ic-lora-refine-details-1.0)..."
-        ensure_refine_details_lora()
 
     yield None, None, "🔄 Đang kiểm tra / đánh thức ComfyUI server..."
     try:
@@ -1116,93 +1298,88 @@ def studio_generate_gradio(
         shutil.copy(path, os.path.join(INPUT_DIR, fname))
         return fname
 
-    pic1_name  = _copy_in(pic1_path, "pic1")
-    pic2_name  = _copy_in(pic2_path, "pic2")
-    pic3_name  = _copy_in(pic3_path, "pic3")
-    pic4_name  = _copy_in(pic4_path, "pic4")
-    bg_name    = _copy_in(bg_path, "bg")
-    start_name = _copy_in(start_frame_path, "start_frame")
-    sheet_name = _copy_in(ingredients_sheet_path, "sheet")
+    pic1_name = _copy_in(act1_path, "act1")
+    pic2_name = _copy_in(act2_path, "act2")
+    pic3_name = _copy_in(act3_path, "act3")
+    pic4_name = _copy_in(act4_path, "act4")
+    bg_name   = _copy_in(bg_path,   "bg")
 
     scene_prompts = prompts if len(prompts) > 1 else [prompts[0]] * max(1, int(num_segments))
     total_scenes  = len(scene_prompts)
     total_secs    = total_scenes * int(v_length)
 
-    refine_status = f"Bật ({refine_lora_strength})" if (run_stage2 and use_refine_lora) else "Tắt"
+    stage2_desc = f"Bật (x2 Spatial Upscale + Refine Details LoRA {refine_lora_strength})" if (run_stage2 and use_refine_lora) else ("Bật (x2 Spatial Upscale)" if run_stage2 else "Tắt (Stage 1 Only)")
     yield None, None, (
         f"✅ Server sẵn sàng. Bắt đầu sản xuất {total_scenes} phân cảnh ({total_secs}s tổng).\n"
-        f"🎬 Chế độ: {studio_mode} · Text Encoder: {active_clip} · Refine Details: {refine_status} · Distilled LoRA: {'Bật' if use_distilled_lora else 'Tắt'}"
+        f"🎬 Chế độ: {studio_mode}\n"
+        f"🔤 Text Encoder: {active_clip}\n"
+        f"✨ Stage 2 Refiner: {stage2_desc}\n"
+        f"⚡ Distilled LoRA: {'Bật' if use_distilled_lora else 'Tắt'}"
     )
 
     generated_videos = []
     for i, p in enumerate(scene_prompts):
         label  = f"phân cảnh {i + 1}/{total_scenes}"
         seed_i = base_seed if fixed_seed else (base_seed + i)
-        p_wrap = apply_quality_wrapping(p, use_wrap=bool(use_quality_wrap))
 
-        yield generated_videos, None, f"🔄 Đang thực hiện {label}... (Seed: {seed_i})\n📝 Prompt: {p[:120]}..."
+        # 1. Làm sạch prompt: loại bỏ audio / speech transcript, tách 2 shot 4s+4s thành nhịp 'Shot 1 | Shot 2' cho PromptRelay
+        p_clean = clean_visual_prompt_for_relay(p)
+        p_wrap  = apply_quality_wrapping(p_clean, use_wrap=bool(use_quality_wrap))
 
-        if "MSR" in studio_mode:
-            wf = build_msr_workflow(
-                prompt_relay_desc = prompt_relay_desc or "",
-                prompt_main       = p_wrap,
-                negative_text     = negative_text or NEGATIVE_PROMPT_DEFAULT,
-                width             = safe_width,
-                height            = safe_height,
-                fps               = v_fps,
-                duration          = v_length,
-                seed              = seed_i,
-                video_cfg         = float(video_cfg or 1.1),
-                pic1_name         = pic1_name,
-                pic2_name         = pic2_name,
-                pic3_name         = pic3_name,
-                pic4_name         = pic4_name,
-                background_name   = bg_name,
-                start_frame_name  = start_name,
-                msr_strength      = msr_strength,
-                reference_frames  = str(reference_frames),
-                run_stage2        = bool(run_stage2),
-                use_distilled_lora = bool(use_distilled_lora),
-                distilled_lora_strength = float(distilled_lora_strength or 1.0),
-                text_encoder_name = active_clip,
-                use_refine_lora   = bool(use_refine_lora),
-                refine_lora_strength = float(refine_lora_strength or 0.6),
-            )
-        elif "Ingredients" in studio_mode:
-            if not sheet_name:
-                yield generated_videos, None, "⚠️ Chế độ Ingredients yêu cầu tải lên Reference Sheet!"
-                return
-            wf = build_ingredients_workflow(
-                sheet_image_name = sheet_name,
-                positive_prompt  = p_wrap,
-                negative_prompt  = negative_text or NEGATIVE_PROMPT_DEFAULT,
-                width            = safe_width,
-                height           = safe_height,
-                fps              = v_fps,
-                duration         = v_length,
-                seed             = seed_i,
-                video_cfg        = float(video_cfg or 1.1),
-                use_distilled_lora = bool(use_distilled_lora),
-                distilled_lora_strength = float(distilled_lora_strength or 1.0),
-                text_encoder_name = active_clip,
-            )
-        else: # Cinema Two-Stage
-            wf = build_cinema_workflow(
-                start_frame_name = start_name,
-                positive_prompt  = p_wrap,
-                negative_prompt  = negative_text or NEGATIVE_PROMPT_DEFAULT,
-                width            = safe_width,
-                height           = safe_height,
-                fps              = v_fps,
-                duration         = v_length,
-                seed             = seed_i,
-                video_cfg        = float(video_cfg or 1.1),
-                use_distilled_lora = bool(use_distilled_lora),
-                distilled_lora_strength = float(distilled_lora_strength or 1.0),
-                text_encoder_name = active_clip,
-                use_refine_lora   = bool(use_refine_lora),
-                refine_lora_strength = float(refine_lora_strength or 0.6),
-            )
+        # 2. Nhận diện các Act có mặt trong phân cảnh này để chỉ nạp slot ảnh của Act đó
+        if smart_actor_filter and (pic2_name or pic3_name or pic4_name):
+            active_map = detect_active_actors_for_scene(p, prompt_relay_desc or "")
+        else:
+            active_map = {"pic1": True, "pic2": True, "pic3": True, "pic4": True, "bg": True}
+
+        cur_pic1 = pic1_name if active_map.get("pic1", True) else None
+        cur_pic2 = pic2_name if active_map.get("pic2", False) else None
+        cur_pic3 = pic3_name if active_map.get("pic3", False) else None
+        cur_pic4 = pic4_name if active_map.get("pic4", False) else None
+        cur_bg   = bg_name   if active_map.get("bg", True)   else None
+
+        # 3. Chuẩn hóa mô tả Act & Background: phân cách bằng \n\n, chỉ giữ Act xuất hiện trong cảnh
+        scene_relay_desc = format_msr_actor_descriptions(prompt_relay_desc, active_slots=active_map)
+
+        active_tags = []
+        if cur_pic1: active_tags.append("Act 1")
+        if cur_pic2: active_tags.append("Act 2")
+        if cur_pic3: active_tags.append("Act 3")
+        if cur_pic4: active_tags.append("Act 4")
+        if cur_bg:   active_tags.append("BG")
+        active_str = ", ".join(active_tags) if active_tags else "Prompt-only"
+
+        yield generated_videos, None, (
+            f"🔄 Đang thực hiện {label}... (Seed: {seed_i})\n"
+            f"👥 Slots nhân vật: [{active_str}]\n"
+            f"🎬 Visual Prompt: {p_clean[:120]}..."
+        )
+
+        wf = build_msr_workflow(
+            prompt_relay_desc = scene_relay_desc,
+            prompt_main       = p_wrap,
+            negative_text     = negative_text or NEGATIVE_PROMPT_DEFAULT,
+            width             = safe_width,
+            height            = safe_height,
+            fps               = v_fps,
+            duration          = v_length,
+            seed              = seed_i,
+            video_cfg         = float(video_cfg or 1.1),
+            pic1_name         = cur_pic1,
+            pic2_name         = cur_pic2,
+            pic3_name         = cur_pic3,
+            pic4_name         = cur_pic4,
+            background_name   = cur_bg,
+            start_frame_name  = None,
+            msr_strength      = msr_strength,
+            reference_frames  = str(reference_frames),
+            run_stage2        = bool(run_stage2),
+            use_distilled_lora = bool(use_distilled_lora),
+            distilled_lora_strength = float(distilled_lora_strength or 1.0),
+            text_encoder_name = active_clip,
+            use_refine_lora   = bool(use_refine_lora),
+            refine_lora_strength = float(refine_lora_strength or 0.6),
+        )
 
         timeout = max(600, int(v_length) * 200)
         try:
@@ -1217,7 +1394,8 @@ def studio_generate_gradio(
         except Exception as e:
             yield generated_videos, None, f"❌ {e}"; return
 
-        latest = find_latest_video()
+        pref = "LTX25_MSR_DualStage" if run_stage2 else "LTX25_MSR_Stage1"
+        latest = find_latest_video(preferred_prefix=pref)
         if not latest:
             yield generated_videos, None, f"⚠️ Không tìm thấy file video đầu ra ở {label}!"; return
 
@@ -1273,9 +1451,8 @@ function(){
 with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple", neutral_hue="slate"), css=custom_css, js=notification_js, title="LTX-2.5 Cinema Studio") as demo:
     with gr.Row(elem_id="ltx-header"):
         gr.Markdown(
-            "# 🎬 LTX-2.5 Cinema Studio — Multi-Subject & Consistency Studio\n"
-            "Sản xuất phim AI chuyên nghiệp với tính nhất quán nhân vật cao: "
-            "MSR 2-Stage (Fixed), Ingredients Reference Sheet & Two-Stage Cinema."
+            "# 🎬 LTX-2.5 MSR Studio — 4 Act & 1 Bối Cảnh Multi-Subject Cinema\n"
+            "Sản xuất phim AI chuẩn điện ảnh: **Stage 2 (x2 Spatial Upscale + Refiner)** · **Refine Details LoRA 1.0** · **Gemma 4 12B BF16** · **4 Act + 1 Background MSR**."
         )
 
     with gr.Row():
@@ -1283,54 +1460,47 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple"
         with gr.Column(scale=6):
             mode_select = gr.Dropdown(
                 choices=[
-                    "🎭 MSR Multi-Subject Reference (2-Stage Upscale)",
-                    "🧪 Ingredients IC-LoRA (Official Reference Sheet)",
-                    "🎥 Cinema Two-Stage I2V/T2V (Start Frame to 2-Stage Refine)"
+                    "🎭 MSR Multi-Subject Reference (4 Act + 1 BG)",
+                    "🎥 Cinema Two-Stage (Không dùng ảnh ref)",
                 ],
-                value="🎭 MSR Multi-Subject Reference (2-Stage Upscale)",
+                value="🎭 MSR Multi-Subject Reference (4 Act + 1 BG)",
                 label="🎬 Chế độ Pipeline (Workflow Mode)",
                 interactive=True
             )
 
-            # KHỐI ẢNH MSR
+            # KHỐI 4 ACT & 1 BACKGROUND
             with gr.Group() as msr_img_group:
-                gr.Markdown("#### 👥 Ảnh tham khảo nhân vật & Bối cảnh (MSR Slots)")
+                gr.Markdown("#### 👥 4 Act Nhân vật & 1 Bối cảnh (MSR Reference Slots)")
                 with gr.Row():
-                    pic1_in = gr.Image(label="Ảnh 1 (Pic 1 - Chính)", type="filepath")
-                    pic2_in = gr.Image(label="Ảnh 2 (Pic 2)", type="filepath")
+                    act1_in = gr.Image(label="🎭 Act 1 (Nhân vật 1 / Pic 1 - Bắt buộc)", type="filepath")
+                    act2_in = gr.Image(label="🎭 Act 2 (Nhân vật 2 / Pic 2 - Tuỳ chọn)", type="filepath")
                 with gr.Row():
-                    pic3_in = gr.Image(label="Ảnh 3 (Pic 3)", type="filepath")
-                    pic4_in = gr.Image(label="Ảnh 4 (Pic 4)", type="filepath")
+                    act3_in = gr.Image(label="🎭 Act 3 (Nhân vật 3 / Pic 3 - Tuỳ chọn)", type="filepath")
+                    act4_in = gr.Image(label="🎭 Act 4 (Nhân vật 4 / Pic 4 - Tuỳ chọn)", type="filepath")
                 with gr.Row():
-                    bg_in   = gr.Image(label="Ảnh Bối cảnh (Background)", type="filepath")
-                    start_frame_in = gr.Image(label="Ảnh Khung hình đầu (Start Frame - Tuỳ chọn)", type="filepath")
-
-            # KHỐI ẢNH INGREDIENTS SHEET
-            with gr.Group(visible=False) as ingredients_img_group:
-                gr.Markdown("#### 🧪 Reference Sheet (Tất cả nhân vật, trang phục, bối cảnh trên 1 ảnh)")
-                sheet_in = gr.Image(label="Tải lên bảng Reference Sheet", type="filepath")
-
-            def _switch_mode(m):
-                is_msr = "MSR" in m
-                is_ing = "Ingredients" in m
-                return (
-                    gr.update(visible=is_msr),
-                    gr.update(visible=is_ing),
-                )
-            mode_select.change(_switch_mode, inputs=mode_select, outputs=[msr_img_group, ingredients_img_group])
+                    bg_in   = gr.Image(label="🏞️ Background (Bối cảnh không gian - Tuỳ chọn)", type="filepath")
 
             # KHỐI PROMPT
             with gr.Group():
                 prompt_relay_in = gr.Textbox(
-                    label="📋 Mô tả nhân vật (Prompt Relay Tagging - Image 1, Image 2...)",
-                    lines=3,
-                    placeholder="Image 1 - Chàng trai áo denim đen...\nImage 2 - Cô gái áo len trắng...\nImage 4 - Scene, quán cafe cổ kính..."
+                    label="📋 Mô tả từng Act & Bối cảnh (Mỗi mô tả cách nhau bằng 1 dòng trống \\n\\n)",
+                    lines=5,
+                    placeholder=(
+                        "Mô tả cho Act 1:\nImage 1: Chàng trai quân sư Lạc Phong và mèo đen Kuro mắt hổ phách phát sáng...\n\n"
+                        "Mô tả cho Act 2:\nImage 2: Công chúa Cáo tuyết chín đuôi Aria lông trắng muốt, mắt ngọc bích...\n\n"
+                        "Mô tả cho Act 3:\nImage 3: Đại tướng cự lang Fenris khổng lồ, giáp sắt phù văn phong băng...\n\n"
+                        "Mô tả cho Act 4:\nImage 4: Đại nguyên soái sư tử Balthazar chân cơ giới ma đạo đồng thau...\n\n"
+                        "Mô tả cho Background:\nBackground: Thánh địa cổ thụ Sylvanheim rừng ma thuật..."
+                    )
                 )
                 scene_counter = gr.Markdown("🔹 **Số phân cảnh:** 0", elem_classes="scene-counter")
                 prompt_main_in = gr.Textbox(
                     label="📝 Kịch bản phân cảnh (Mỗi đoạn cách nhau 1 dòng trống là 1 phân cảnh)",
                     lines=6,
-                    placeholder="Cảnh quay toàn phòng khách, chàng trai ngồi giữa hai cô gái...\n\nCận cảnh cô gái bên trái bật cười và nói: 'Kể lại chuyện đó đi!'..."
+                    placeholder=(
+                        "Dán toàn bộ kịch bản các phân cảnh vào đây.\n"
+                        "Hệ thống sẽ tự động làm sạch Audio/Voiceover, chia nhịp cú máy (0s-4s | 4s-8s), và tự động nạp đúng Act xuất hiện trong từng cảnh."
+                    )
                 )
                 neg_prompt_in = gr.Textbox(
                     label="🚫 Negative Prompt",
@@ -1359,13 +1529,20 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple"
                 segments_in = gr.Slider(minimum=1, maximum=10, value=1, step=1, label="Số phân cảnh lặp (nếu chỉ 1 prompt)")
                 fixed_seed_in = gr.Checkbox(label="Cố định Seed cho mọi cảnh", value=True)
 
-            with gr.Accordion("⚙️ Tùy chỉnh nâng cao & Bộ nhớ", open=False):
-                cfg_in = gr.Slider(minimum=1.0, maximum=3.0, value=1.1, step=0.1, label="Video CFG Scale", info="Khuyên dùng 1.0 - 1.2 cho model Distilled để tránh cháy sáng / bóng dầu")
-                msr_str_in = gr.Slider(minimum=0.1, maximum=1.0, value=0.7, step=0.05, label="MSR Reference Strength")
-                ref_frames_in = gr.Dropdown(choices=["17", "33", "49"], value="33", label="Số Frame tham chiếu MSR")
-                stage2_in  = gr.Checkbox(label="Chạy Stage 2 (x2 Spatial Upscale + Refiner)", value=True)
-                lowvram_in = gr.Checkbox(label="Low VRAM Mode (Bật khi dùng GPU ≤16GB)", value=True)
-                wrap_in    = gr.Checkbox(label="Tự động thêm tiền tố/hậu tố chất lượng điện ảnh (Matte Film Look)", value=True)
+            # KHỐI CẤU HÌNH ĐIỆN ẢNH CAO CẤP (STAGE 2 REFINER + REFINE DETAILS LORA + GEMMA BF16)
+            with gr.Group():
+                gr.Markdown("#### ✨ Cấu hình Siêu Nét & Điện Ảnh (Stage 2 Refiner & Gemma BF16)")
+                with gr.Row():
+                    stage2_in = gr.Checkbox(
+                        label="🚀 Chạy Stage 2 (x2 Spatial Upscale + Refiner)",
+                        value=True,
+                        info="Tự động nhân đôi độ phân giải không gian và tinh chỉnh nét từng khung hình."
+                    )
+                    refine_lora_in = gr.Checkbox(
+                        label="✨ Dùng Refine Details LoRA ở Stage 2 (ltx-2.5-22b-ic-lora-refine-details-1.0)",
+                        value=True,
+                        info="LoRA chính thức tinh chỉnh siêu nét chi tiết da mặt, sợi tóc/lông, texture cho Stage 2 Refiner."
+                    )
                 with gr.Row():
                     text_encoder_in = gr.Dropdown(
                         choices=[
@@ -1376,16 +1553,17 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple"
                         label="🔤 Text Encoder (Gemma 4 12B with Projection)",
                         info="BF16: Khả năng diễn giải prompt và chi tiết tối đa | INT8: Tiết kiệm ~12GB VRAM/RAM cho GPU ≤16GB"
                     )
-                with gr.Row():
-                    refine_lora_in = gr.Checkbox(
-                        label="✨ Dùng Refine Details LoRA ở Stage 2 (ltx-2.5-22b-ic-lora-refine-details-1.0)",
-                        value=True,
-                        info="LoRA chính thức tinh chỉnh siêu nét chi tiết da mặt, sợi tóc, texture cho Stage 2 Refiner."
-                    )
                     refine_lora_str_in = gr.Slider(
                         minimum=0.1, maximum=1.0, value=0.6, step=0.05,
                         label="Độ mạnh Refine Details LoRA (Khuyên dùng 0.5 - 0.6)"
                     )
+
+            with gr.Accordion("⚙️ Tùy chỉnh nâng cao & Bộ nhớ", open=False):
+                cfg_in = gr.Slider(minimum=1.0, maximum=3.0, value=1.1, step=0.1, label="Video CFG Scale", info="Khuyên dùng 1.0 - 1.2 cho model Distilled để tránh cháy sáng / bóng dầu")
+                msr_str_in = gr.Slider(minimum=0.1, maximum=1.0, value=0.7, step=0.05, label="MSR Reference Strength")
+                ref_frames_in = gr.Dropdown(choices=["17", "33", "49"], value="33", label="Số Frame tham chiếu MSR")
+                lowvram_in = gr.Checkbox(label="Low VRAM Mode (Bật khi dùng GPU ≤16GB)", value=True)
+                wrap_in    = gr.Checkbox(label="Tự động thêm tiền tố/hậu tố chất lượng điện ảnh (Matte Film Look)", value=True)
                 with gr.Row():
                     distilled_lora_in = gr.Checkbox(
                         label="⚡ Dùng Official Distilled LoRA 450 (ltx-2.5-22b-distilled-lora-450-bf16)",
@@ -1395,6 +1573,12 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple"
                     distilled_lora_str_in = gr.Slider(
                         minimum=0.1, maximum=1.0, value=1.0, step=0.05,
                         label="Độ mạnh Distilled LoRA (Strength)"
+                    )
+                with gr.Row():
+                    smart_filter_in = gr.Checkbox(
+                        label="🎯 Tự động phân bổ Act theo phân cảnh (Smart Scene Actor Mapping)",
+                        value=True,
+                        info="Tự động chỉ nạp ảnh của nhân vật xuất hiện trong cảnh, ngăn ngừa các nhân vật khác bị ép vào sai cảnh."
                     )
 
             with gr.Row():
@@ -1421,13 +1605,14 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple"
         studio_generate_gradio,
         inputs=[
             mode_select,
-            pic1_in, pic2_in, pic3_in, pic4_in, bg_in, start_frame_in, sheet_in,
+            act1_in, act2_in, act3_in, act4_in, bg_in,
             prompt_relay_in, prompt_main_in, neg_prompt_in,
             aspect_in, duration_in, fps_in, seed_in, segments_in, fixed_seed_in,
             cfg_in, msr_str_in, ref_frames_in, stage2_in, lowvram_in, wrap_in,
             distilled_lora_in, distilled_lora_str_in,
             text_encoder_in,
             refine_lora_in, refine_lora_str_in,
+            smart_filter_in,
         ],
         outputs=[gallery_out, final_video_out, status_box]
     )

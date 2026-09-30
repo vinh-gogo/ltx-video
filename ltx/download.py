@@ -70,9 +70,9 @@ if not HF_TOKEN:
         "🔑 Chưa tìm thấy HF_TOKEN. Vui lòng nhập token tại ô bên dưới "
         "(Token không hiển thị vì lý do bảo mật).\n"
         "Lấy token tại: https://huggingface.co/settings/tokens\n"
-        "Đồng thời nhớ bấm 'Agree and access repository' tại 2 repo này:\n"
+        "Đồng thời nhớ bấm 'Agree and access repository' tại 2 repo chính thức:\n"
         "  👉 1) https://huggingface.co/Lightricks/LTX-2.5\n"
-        "  👉 2) https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients\n",
+        "  👉 2) https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Refine-Details\n",
         color="#ffb300",
     )
     try:
@@ -257,15 +257,11 @@ DOWNLOAD_JOBS.extend([
     ("https://huggingface.co/Lightricks/LTX-2.5/resolve/main/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors",
      f"{COMFYUI_ROOT}/models/loras", DISTILLED_LORA_FILENAME, True),
 
-    # 8. Official Lightricks IC-LoRA Refine Details (Stage 2 Super Sharpness Refiner)
+    # 8. Official Lightricks IC-LoRA Refine Details (Stage 2 Super Sharpness Refiner) — GATED!
     ("https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Refine-Details/resolve/main/ltx-2.5-22b-ic-lora-refine-details-1.0.safetensors",
      f"{COMFYUI_ROOT}/models/loras", REFINE_DETAILS_LORA_FILENAME, True),
 
-    # 9. Official Ingredients IC-LoRA (Lightricks Character Reference Sheet) — GATED!
-    ("https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients/resolve/main/ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors",
-     f"{COMFYUI_ROOT}/models/loras", INGREDIENTS_LORA_FILENAME, True),
-
-    # 10. Real-ESRGAN x4
+    # 9. Real-ESRGAN x4
     ("https://huggingface.co/ai-forever/Real-ESRGAN/resolve/main/RealESRGAN_x4.pth",
      f"{COMFYUI_ROOT}/models/upscale_models", REALESRGAN_FILENAME, False),
 ])
@@ -296,6 +292,27 @@ try:
 except Exception:
     pass
 
+# Đồng bộ Upscaler giữa models/latent_upscale_models/ và models/upscale_models/
+try:
+    _lu_dir = os.path.join(COMFYUI_ROOT, "models", "latent_upscale_models")
+    _u_dir = os.path.join(COMFYUI_ROOT, "models", "upscale_models")
+    os.makedirs(_lu_dir, exist_ok=True)
+    os.makedirs(_u_dir, exist_ok=True)
+    _src = os.path.join(_lu_dir, SPATIAL_UPSCALER_FILENAME)
+    _dst = os.path.join(_u_dir, SPATIAL_UPSCALER_FILENAME)
+    if os.path.exists(_src) and not os.path.exists(_dst):
+        try:
+            os.symlink(_src, _dst)
+        except Exception:
+            import shutil; shutil.copy2(_src, _dst)
+    elif os.path.exists(_dst) and not os.path.exists(_src):
+        try:
+            os.symlink(_dst, _src)
+        except Exception:
+            import shutil; shutil.copy2(_dst, _src)
+except Exception:
+    pass
+
 # Đồng bộ Text Encoders giữa models/text_encoders/ và models/clip/ để CLIPLoader luôn nhận diện được
 try:
     _te_dir = os.path.join(COMFYUI_ROOT, "models", "text_encoders")
@@ -310,7 +327,7 @@ try:
                 os.symlink(_src, _dst)
             except Exception:
                 import shutil; shutil.copy2(_src, _dst)
-        elif os.path.exists(_dst) and not os.path.exists(_src):
+        elif os.path.exists(_clip_dir, _fname) and not os.path.exists(_te_dir, _fname):
             try:
                 os.symlink(_dst, _src)
             except Exception:
@@ -321,34 +338,28 @@ except Exception:
 # --------------------------------------------------------------------------
 # [4/4] Báo cáo kết quả
 # --------------------------------------------------------------------------
-critical_fails = [f for f in _FAILED_DOWNLOADS if f not in (INGREDIENTS_LORA_FILENAME, DISTILLED_LORA_FILENAME, REFINE_DETAILS_LORA_FILENAME, TEXT_ENCODER_INT8_FILENAME)]
+critical_fails = [f for f in _FAILED_DOWNLOADS if f not in (DISTILLED_LORA_FILENAME, TEXT_ENCODER_INT8_FILENAME)]
 
 if critical_fails:
     log(
         f"❌ Có {len(critical_fails)} file cốt lõi tải lỗi: {', '.join(critical_fails)}.\n"
-        "Vui lòng kiểm tra lại quyền truy cập repo https://huggingface.co/Lightricks/LTX-2.5 và chạy lại Cell này.",
+        "Vui lòng đảm bảo đã bấm 'Agree and access repository' tại 2 repo:\n"
+        "  👉 1) https://huggingface.co/Lightricks/LTX-2.5\n"
+        "  👉 2) https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Refine-Details\n"
+        "và chạy lại Cell này.",
         color="#ff5252"
     )
-elif INGREDIENTS_LORA_FILENAME in _FAILED_DOWNLOADS:
-    display(HTML(
-        "<div style='padding:15px;background-color:#fff3e0;border-left:5px solid #ff9800;"
-        "border-radius:4px;color:#e65100;font-family:sans-serif;'>"
-        "<b>⚠️ Lưu ý về Ingredients IC-LoRA:</b> File <code>ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors</code> chưa tải được.<br>"
-        "👉 Để dùng chế độ Ingredients, bạn cần vào link: <a href='https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients' target='_blank'><b>https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients</b></a> và bấm <b>'Agree and access repository'</b>, sau đó chạy lại Cell này.<br>"
-        "<b>✅ TUY NHIÊN:</b> Toàn bộ các model cho <b>MSR 2-Stage</b> và <b>Cinema Two-Stage</b> đã tải xong 100%! Bạn có thể chuyển sang <b>Cell 2 (%run ltx/ltx2_5_msr.py)</b> để tạo video ngay lập tức!"
-        "</div>"
-    ))
 else:
     display(HTML(
         "<div style='padding:15px;background-color:#e8f5e9;border-left:5px solid #4caf50;"
         "border-radius:4px;color:#2e7d32;font-family:sans-serif;'>"
-        "<b>✨ Initialization Complete!</b> Hệ thống LTX-2.5 Studio đã sẵn sàng.<br>"
+        "<b>✨ Initialization Complete!</b> Hệ thống LTX-2.5 Cinema Studio đã sẵn sàng 100%.<br>"
         "🧬 <b>MSR LoRA:</b> <code>models/loras/ltx2.5/LTX-2.5-Licon-MSR-V1.safetensors</code><br>"
+        "✨ <b>Refine Details LoRA 1.0 (Stage 2):</b> <code>models/loras/ltx-2.5-22b-ic-lora-refine-details-1.0.safetensors</code><br>"
+        "🔤 <b>Text Encoder:</b> Gemma 4 12B BF16 (Chuẩn cao cấp trong <code>models/text_encoders/</code>)<br>"
+        "🚀 <b>Spatial Upscaler x2:</b> <code>models/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors</code><br>"
         "⚡ <b>Distilled LoRA 450:</b> <code>models/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors</code><br>"
-        "✨ <b>Refine Details LoRA:</b> <code>models/loras/ltx-2.5-22b-ic-lora-refine-details-1.0.safetensors</code><br>"
-        "🧪 <b>Ingredients IC-LoRA:</b> <code>models/loras/ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors</code><br>"
-        "🔤 <b>Text Encoder:</b> Gemma 4 12B (BF16 & INT8 trong <code>models/text_encoders/</code>)<br>"
-        "📦 <b>Core Models:</b> Transformer (int8-convrot) + Video/Audio VAEs + Spatial Upscaler x2<br>"
+        "📦 <b>Core Transformer:</b> <code>ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors</code> + VAEs<br>"
         "👉 Sẵn sàng chuyển sang <b>Cell 2 (%run ltx/ltx2_5_msr.py)</b> để khởi chạy Gradio Live Studio!"
         "</div>"
     ))
