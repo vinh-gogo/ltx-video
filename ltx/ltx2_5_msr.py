@@ -65,10 +65,13 @@ QUALITY_SUFFIX = (
 )
 
 NEGATIVE_PROMPT_DEFAULT = (
+    "talking head, webcam, facecam, streamer box, reaction video, presenter in corner, "
+    "corner portrait, speaker window, narrator box, PIP, picture-in-picture, floating avatar, "
+    "news anchor, screen-in-screen, corner camera, inset box, selfie frame, "
     "oily skin, greasy skin, plastic skin, waxy skin, glossy surface, shiny forehead, "
     "specular reflection, specular bloom, overexposed, blown out highlights, oversharpened, "
     "split screen, collage, grid, multiple panels, photo frame, triple view, character sheet, "
-    "lineup, side by side, border, letterbox, white bars, inset image, picture-in-picture, "
+    "lineup, side by side, border, letterbox, white bars, inset image, "
     "blurry, oversaturated, pixelated, low resolution, grainy, distorted, noise, "
     "compression artifacts, glitches, watermark, text, logo, subtitles, "
     "static frame, frozen image, lack of motion, deformed limbs, extra paws, duplicate limbs, "
@@ -258,18 +261,20 @@ def apply_quality_wrapping(prompt, use_wrap=True):
 
 def clean_visual_prompt_for_relay(prompt):
     """
-    1. Cắt bỏ Audio / Sound / Voiceover / Lời thoại / Speech transcripts ra khỏi prompt thị giác.
-    2. Chuyển đổi các cú máy 2 shot (vd: First 4 seconds ... At precisely 4 seconds ...) thành cú pháp nhịp 'Shot 1 | Shot 2' cho PromptRelayEncode.
+    1. Cắt bỏ các khối metadata Audio / Sound / Speech / Voiceover rời rạc ở đuôi prompt.
+    2. Giữ lại các câu thoại diễn xuất trong ngoặc kép ở Shot 1 và Shot 2 để Text Encoder điều hướng khẩu hình và cử động nói của nhân vật.
+    3. Chuyển đổi các cú máy 2 shot (vd: First 4 seconds ... At precisely 4 seconds ...) thành cú pháp nhịp 'Shot 1 | Shot 2' cho PromptRelayEncode.
     """
     if not prompt or not prompt.strip():
         return ""
     p = prompt.strip()
 
-    # Cắt bỏ Audio / Voiceover / Lời thoại / Thuyết minh / 旁白 / 音频
-    p = re.split(r"(?i)\b(?:Audio|Sound effects|SFX|Voiceover|Narration|Lời thoại|Thuyết minh)\s*[:：]|(?:旁白|音频|音效)\s*[:：]", p)[0].strip()
+    # Cắt bỏ thẻ phân cảnh độc lập nếu còn sót: [Scene 1], [Phân cảnh 1]
+    p = re.sub(r"\[(?:Scene|Phân\s*cảnh|Cảnh)\s*\d+[^\]]*\]\s*", "", p, flags=re.IGNORECASE).strip()
 
-    # Xóa các chuỗi lời thoại còn sót: [00:00-00:04] "..."
-    p = re.sub(r'\[\d{2}:\d{2}\s*-\s*\d{2}:\d{2}\][^"\u201c\n]*["\u201c][^"\u201d]*["\u201d]', '', p).strip()
+    # Cắt bỏ phần Audio/Speech metadata block ở cuối (nếu có nhãn Audio: hoặc Speech: đứng riêng ở đuôi)
+    p = re.split(r"(?i)\b(?:Audio|Sound effects|SFX)\s*[:：]|(?:音频|音效)\s*[:：]", p)[0].strip()
+    p = re.split(r"(?i)\b(?:Speech|Voiceover|Narration|Lời thoại|Thuyết minh|Dialogue)\s*(?:\([^)]*\))?\s*[:：]", p)[0].strip()
 
     # Nhận diện điểm chuyển cảnh (Giây thứ 4 hoặc giữa 2 shot)
     split_pattern = r"(?i)(?:[,\.，。\s]+)(?:At precisely (?:4 seconds|00:04)|At 4 seconds|Chuyển cảnh (?:tại |ở |\(|\:)?00:04\)?|后4秒[：:]?|第4秒[：:]?)[,\s:：]*"
@@ -284,52 +289,186 @@ def clean_visual_prompt_for_relay(prompt):
     return p
 
 
-def format_msr_actor_descriptions(text, active_slots=None):
+def parse_actor_descriptions(text):
     """
-    Chuẩn hóa mô tả các Act & Background:
-    - Mỗi mô tả cách nhau bằng 1 dòng trống (\\n\\n).
-    - Tự động gắn nhãn Image 1:, Image 2:, Image 3:, Image 4:, Background: nếu chưa có.
-    - Lọc chỉ giữ lại mô tả của các Act thực sự xuất hiện trong phân cảnh hiện tại.
+    Tách các khối mô tả cho Act 1 -> Act 5 và Background.
+    Nhận diện qua nhãn 'Image X:', 'Act X:', 'Pic X:' hoặc theo thứ tự khối.
+    """
+    if not text or not text.strip():
+        return {}
+    blocks = [b.strip() for b in re.split(r"\n[ \t]*\n+", text.strip()) if b.strip()]
+    desc_map = {}
+    default_order = ["act1", "act2", "act3", "act4", "act5", "bg"]
+
+    for i, b in enumerate(blocks):
+        m = re.match(r"^(?:Image|Pic|Act)\s*([1-5])[\s*:\-]\s*(.*)$", b, re.IGNORECASE | re.DOTALL)
+        if m:
+            act_num = m.group(1)
+            desc_content = m.group(2).strip()
+            desc_map[f"act{act_num}"] = desc_content
+            continue
+
+        m_bg = re.match(r"^(?:Background|BG|Bối cảnh)[\s*:\-]\s*(.*)$", b, re.IGNORECASE | re.DOTALL)
+        if m_bg:
+            desc_map["bg"] = m_bg.group(1).strip()
+            continue
+
+        if i < len(default_order):
+            key = default_order[i]
+            if key not in desc_map:
+                desc_map[key] = b
+    return desc_map
+
+
+def format_msr_actor_descriptions_dynamic(text, active_present, cur_bg):
+    """
+    Chuẩn hóa mô tả nhân vật cho PromptRelayEncode:
+    - active_present: list tuple [ (act_key, file_name, label), ... ]
+    - Đánh số Image 1:, Image 2:, Image 3:... tương ứng với các slot nạp vào ComfyUI
+    - Thêm Background: nếu có bối cảnh
     """
     if not text or not text.strip():
         return ""
-    blocks = [b.strip() for b in re.split(r"\n[ \t]*\n+", text.strip()) if b.strip()]
-    formatted = []
-    default_tags = ["Image 1: ", "Image 2: ", "Image 3: ", "Image 4: ", "Background: "]
-    slot_keys = ["pic1", "pic2", "pic3", "pic4", "bg"]
+    desc_map = parse_actor_descriptions(text)
+    relay_lines = []
 
-    for i, b in enumerate(blocks):
-        slot_key = slot_keys[i] if i < len(slot_keys) else f"pic{i+1}"
-        if active_slots and not active_slots.get(slot_key, True):
-            continue
-        if re.match(r"^(?:Image\s*\d+|Pic\s*\d+|Background|Act\s*\d+)[\s*:\-]", b, re.IGNORECASE):
-            formatted.append(b)
+    for idx, (key, _, _) in enumerate(active_present, 1):
+        desc = desc_map.get(key, "")
+        if desc:
+            clean_desc = re.sub(r"^(?:Image|Pic|Act)\s*\d+[\s*:\-]\s*", "", desc).strip()
+            relay_lines.append(f"Image {idx}: {clean_desc}")
         else:
-            tag = default_tags[i] if i < len(default_tags) else f"Image {i+1}: "
-            formatted.append(f"{tag}{b}")
-    return "\n\n".join(formatted)
+            relay_lines.append(f"Image {idx}: Character {key}")
+
+    if cur_bg and desc_map.get("bg"):
+        clean_bg = re.sub(r"^(?:Background|BG|Bối cảnh)[\s*:\-]\s*", "", desc_map["bg"]).strip()
+        relay_lines.append(f"Background: {clean_bg}")
+
+    return "\n\n".join(relay_lines)
+
+
+def extract_cast_tag(prompt):
+    """
+    Trích xuất thẻ chỉ định nhân vật và phân cảnh trong prompt, ví dụ:
+    [Scene 1 | Cast: Act 1], [Scene 2, Cast: 1, 3], [Cast: Act 1, Act 3, Act 5],
+    [Act: 1, 2], [Actors: 1, 4], [Nhân vật: 1, 3, 5]
+    Trả về: (dict_active_actors, prompt_sau_khi_xoa_the)
+    """
+    if not prompt or not prompt.strip():
+        return None, prompt
+
+    # Bắt các dạng kết hợp phân cảnh và cast: [Scene 1 | Cast: Act 1], [Phân cảnh 1 | Cast: 1, 3]
+    tag_pattern = r"\[(?:(?:Scene|Phân\s*cảnh|Cảnh)\s*\d+\s*[\|\,\;]\s*)?(?:Cast|Actors?|Acts?|Nhân\s*vật|Slots?)\s*[:=]\s*([^\]]+)\]"
+    match = re.search(tag_pattern, prompt, re.IGNORECASE)
+    cleaned_prompt = prompt
+    tag_content = ""
+    if match:
+        tag_content = match.group(1).lower().strip()
+        cleaned_prompt = re.sub(tag_pattern, "", cleaned_prompt, count=1, flags=re.IGNORECASE).strip()
+    else:
+        simple_pattern = r"\[(?:Cast|Actors?|Acts?|Nhân\s*vật|Slots?)\s*[:=]\s*([^\]]+)\]"
+        m_simple = re.search(simple_pattern, prompt, re.IGNORECASE)
+        if m_simple:
+            tag_content = m_simple.group(1).lower().strip()
+            cleaned_prompt = re.sub(simple_pattern, "", cleaned_prompt, count=1, flags=re.IGNORECASE).strip()
+
+    # Xóa cả thẻ [Scene X] đứng độc lập nếu còn sót
+    cleaned_prompt = re.sub(r"\[(?:Scene|Phân\s*cảnh|Cảnh)\s*\d+[^\]]*\]\s*", "", cleaned_prompt, flags=re.IGNORECASE).strip()
+
+    if not tag_content:
+        return None, cleaned_prompt
+
+    active = {f"act{i}": False for i in range(1, 6)}
+    active["bg"] = True
+
+    # 1. Kiểm tra số 1 -> 5
+    for i in range(1, 6):
+        if re.search(rf"\b(?:act|pic|image|số)?\s*{i}\b", tag_content):
+            active[f"act{i}"] = True
+
+    # 2. Kiểm tra tên nhân vật
+    if any(k in tag_content for k in ["kuro", "lạc phong", "mèo", "cat"]):
+        active["act1"] = True
+    if any(k in tag_content for k in ["aria", "cáo", "fox", "cửu vĩ"]):
+        active["act2"] = True
+    if any(k in tag_content for k in ["fenris", "sói", "wolf"]):
+        active["act3"] = True
+    if any(k in tag_content for k in ["balthazar", "sư tử", "lion"]):
+        active["act4"] = True
+    if any(k in tag_content for k in ["malakor", "quạ", "raven"]):
+        active["act5"] = True
+
+    # Kiểm tra tắt bối cảnh nếu có yêu cầu
+    if any(k in tag_content for k in ["no bg", "không bg", "không bối cảnh", "no background"]):
+        active["bg"] = False
+
+    return active, cleaned_prompt
+
+
+def extract_scene_speech(prompt, scene_index=1):
+    """
+    Trích xuất lời thoại tiếng Việt chuẩn của phân cảnh X:
+    - scene_idx: số thứ tự phân cảnh (ví dụ: 1 đến 10)
+    - shot1_text: lời thoại shot 1 [00:00-00:04]
+    - shot2_text: lời thoại shot 2 [00:04-00:08]
+    - full_speech: toàn bộ câu thoại tiếng Việt gộp
+    - has_speech: True nếu tìm thấy lời thoại
+    """
+    if not prompt or not prompt.strip():
+        return {"scene_idx": scene_index, "shot1_text": "", "shot2_text": "", "full_speech": "", "has_speech": False}
+
+    m_scene = re.search(r"\[(?:Scene|Phân\s*cảnh|Cảnh)\s*([0-9]+)", prompt, re.IGNORECASE)
+    scene_idx = int(m_scene.group(1)) if m_scene else scene_index
+
+    # 1. Bắt theo định dạng mốc thời gian chuẩn: [00:00-00:04] "..." [00:04-00:08] "..."
+    m_s1 = re.search(r"\[00:00\s*-\s*00:04\]\s*[\"“]([^\"”]+)[\"”]", prompt)
+    m_s2 = re.search(r"\[00:04\s*-\s*00:08\]\s*[\"“]([^\"”]+)[\"”]", prompt)
+
+    shot1_text = m_s1.group(1).strip() if m_s1 else ""
+    shot2_text = m_s2.group(1).strip() if m_s2 else ""
+
+    # 2. Nếu không có timestamp, trích xuất từ câu trong ngoặc kép ở khối Speech/Lời thoại
+    if not shot1_text and not shot2_text:
+        speech_match = re.search(r"(?i)\b(?:Speech|Voiceover|Lời thoại|Dialogue)\b[^:\n]*[:=]\s*(.*)", prompt)
+        search_target = speech_match.group(1) if speech_match else prompt
+        quotes = re.findall(r"[\"“]([^\"”]{6,})[\"”]", search_target)
+        if len(quotes) >= 2:
+            shot1_text = quotes[0].strip()
+            shot2_text = quotes[1].strip()
+        elif len(quotes) == 1:
+            shot1_text = quotes[0].strip()
+
+    full_speech = " ".join(filter(None, [shot1_text, shot2_text]))
+    return {
+        "scene_idx": scene_idx,
+        "shot1_text": shot1_text,
+        "shot2_text": shot2_text,
+        "full_speech": full_speech,
+        "has_speech": bool(full_speech),
+    }
 
 
 def detect_active_actors_for_scene(prompt, relay_desc=""):
     """
-    Tự động nhận diện những Act nào xuất hiện trong phân cảnh để chỉ nạp slot ảnh đó.
-    Ngăn chặn việc các nhân vật khác bị ép vào sai phân cảnh (vd: Cáo và Sói bị ép vào Cảnh 1).
+    Tự động nhận diện những Act nào xuất hiện trong phân cảnh dựa trên từ khóa kịch bản.
+    Ngăn chặn việc các nhân vật khác bị ép vào sai phân cảnh.
     """
     p_lower = prompt.lower()
     patterns = {
-        "pic1": [r"\bimage\s*1\b", r"\bpic\s*1\b", r"\bact\s*1\b", r"kuro", r"mèo", r"cat", r"lạc phong", r"strategist", r"tom cat", r"tomcat", r"feline", r"黑猫", r"骆峰"],
-        "pic2": [r"\bimage\s*2\b", r"\bpic\s*2\b", r"\bact\s*2\b", r"aria", r"cáo", r"fox", r"hồ ly", r"nine-tailed", r"cửu vĩ", r"狐狸", r"阿莉亚", r"九尾"],
-        "pic3": [r"\bimage\s*3\b", r"\bpic\s*3\b", r"\bact\s*3\b", r"fenris", r"sói", r"wolf", r"wolves", r"frost wolf", r"cự lang", r"狼", r"芬里斯"],
-        "pic4": [r"\bimage\s*4\b", r"\bpic\s*4\b", r"\bact\s*4\b", r"balthazar", r"sư tử", r"lion", r"iron lion", r"magitech lion", r"巴尔萨泽", r"狮子"],
+        "act1": [r"\bimage\s*1\b", r"\bpic\s*1\b", r"\bact\s*1\b", r"kuro", r"mèo", r"cat", r"lạc phong", r"strategist", r"tom cat", r"tomcat", r"feline", r"黑猫", r"骆峰"],
+        "act2": [r"\bimage\s*2\b", r"\bpic\s*2\b", r"\bact\s*2\b", r"aria", r"cáo", r"fox", r"hồ ly", r"nine-tailed", r"cửu vĩ", r"bạch hồ", r"狐狸", r"阿莉亚", r"九尾"],
+        "act3": [r"\bimage\s*3\b", r"\bpic\s*3\b", r"\bact\s*3\b", r"fenris", r"sói", r"wolf", r"wolves", r"frost wolf", r"cự lang", r"狼", r"芬里斯"],
+        "act4": [r"\bimage\s*4\b", r"\bpic\s*4\b", r"\bact\s*4\b", r"balthazar", r"sư tử", r"lion", r"iron lion", r"magitech lion", r"巴尔萨泽", r"狮子"],
+        "act5": [r"\bimage\s*5\b", r"\bpic\s*5\b", r"\bact\s*5\b", r"malakor", r"quạ", r"raven", r"sorcerer", r"hắc quạ", r"cự quạ", r"noxis", r"乌鸦", r"马拉科尔"],
     }
 
     if relay_desc and relay_desc.strip():
-        blocks = [b.strip() for b in re.split(r"\n[ \t]*\n+", relay_desc.strip()) if b.strip()]
-        slot_keys = ["pic1", "pic2", "pic3", "pic4"]
-        for i, b in enumerate(blocks[:4]):
-            words = re.findall(r"[\w\u00C0-\u1EF9]+", b)
-            keywords = [w.lower() for w in words if len(w) >= 4 and w.lower() not in ["image", "bối", "cảnh", "nhân", "vật"]]
-            patterns[slot_keys[i]].extend([rf"\b{re.escape(k)}\b" for k in keywords[:5]])
+        desc_map = parse_actor_descriptions(relay_desc)
+        for act_key, desc in desc_map.items():
+            if act_key in patterns:
+                words = re.findall(r"[\w\u00C0-\u1EF9]+", desc)
+                keywords = [w.lower() for w in words if len(w) >= 4 and w.lower() not in ["image", "bối", "cảnh", "nhân", "vật"]]
+                patterns[act_key].extend([rf"\b{re.escape(k)}\b" for k in keywords[:5]])
 
     active = {}
     for slot, kws in patterns.items():
@@ -337,7 +476,7 @@ def detect_active_actors_for_scene(prompt, relay_desc=""):
 
     # Nếu không match slot nào, mặc định nạp Act 1 (nhân vật chính)
     if not any(active.values()):
-        active["pic1"] = True
+        active["act1"] = True
     active["bg"] = True
     return active
 
@@ -835,6 +974,63 @@ def concat_videos(video_list, out_name):
     return video_list[-1]
 
 
+def generate_speech_audio_edge_tts(text, voice="vi-VN-NamMinhNeural", rate="+15%", out_path=None):
+    """Tạo file âm thanh thuyết minh tiếng Việt tự động bằng edge-tts."""
+    if not text or not text.strip():
+        return None
+    if not out_path:
+        out_path = os.path.join(OUTPUT_DIR, f"speech_{int(time.time())}_{random.randint(100,999)}.mp3")
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    try:
+        import asyncio
+        import edge_tts
+        async def _gen():
+            comm = edge_tts.Communicate(text.strip(), voice=voice, rate=rate)
+            await comm.save(out_path)
+        asyncio.run(_gen())
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 100:
+            return out_path
+    except Exception as e:
+        print(f"⚠️ Lỗi Edge-TTS: {e}")
+    return None
+
+
+def mux_speech_to_video(video_path, audio_path, out_path=None):
+    """Ghép hoặc hòa trộn audio thuyết minh vào video bằng ffmpeg (đồng bộ độ dài video)."""
+    if not audio_path or not os.path.exists(audio_path):
+        return video_path
+    if not out_path:
+        out_path = video_path.rsplit(".", 1)[0] + "_voiced.mp4"
+    try:
+        probe_cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", video_path]
+        probe_res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+        has_orig_audio = bool(probe_res.stdout.strip())
+
+        if has_orig_audio:
+            # Hòa trộn: Voiceover (volume 1.3), âm thanh môi trường gốc LTX-2.5 (volume 0.3)
+            filter_complex = "[0:a]volume=0.3[a0];[1:a]volume=1.3[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+            cmd = [
+                "ffmpeg", "-y", "-i", video_path, "-i", audio_path,
+                "-filter_complex", filter_complex,
+                "-map", "0:v:0", "-map", "[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-shortest", out_path
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y", "-i", video_path, "-i", audio_path,
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-shortest", out_path
+            ]
+        run_res = subprocess.run(cmd, capture_output=True, timeout=60)
+        if run_res.returncode == 0 and os.path.exists(out_path):
+            return out_path
+    except Exception as e:
+        print(f"⚠️ Lỗi mux speech audio: {e}")
+    return video_path
+
+
 # ==============================================================================
 # HÀM GỬI PROMPT & THEO DÕI TIẾN TRÌNH COMFYUI
 # ==============================================================================
@@ -1251,7 +1447,8 @@ def build_cinema_workflow(
 # ==============================================================================
 def studio_generate_gradio(
     studio_mode,
-    act1_path, act2_path, act3_path, act4_path, bg_path,
+    act1_path, act2_path, act3_path, act4_path, act5_path, bg_path,
+    actor_assignment_mode, manual_actors_selected,
     prompt_relay_desc, prompt_main, negative_text,
     aspect_ratio, v_length, v_fps, v_seed=0, num_segments=1, fixed_seed=True,
     video_cfg=1.1, msr_strength=0.7, reference_frames="33", run_stage2=True, low_vram=True, use_quality_wrap=True,
@@ -1259,6 +1456,9 @@ def studio_generate_gradio(
     text_encoder_choice="gemma4-12b-with-proj-ltx-2.5-bf16.safetensors (BF16 Chuẩn cao cấp)",
     use_refine_lora=True, refine_lora_strength=0.6,
     smart_actor_filter=True,
+    auto_speech_tts=True,
+    tts_voice="vi-VN-NamMinhNeural (Nam - Trầm ấm, điện ảnh, chiến lược)",
+    tts_rate=15,
 ):
     prompts = split_prompts(prompt_main)
     if not prompts:
@@ -1302,6 +1502,7 @@ def studio_generate_gradio(
     pic2_name = _copy_in(act2_path, "act2")
     pic3_name = _copy_in(act3_path, "act3")
     pic4_name = _copy_in(act4_path, "act4")
+    pic5_name = _copy_in(act5_path, "act5")
     bg_name   = _copy_in(bg_path,   "bg")
 
     scene_prompts = prompts if len(prompts) > 1 else [prompts[0]] * max(1, int(num_segments))
@@ -1314,7 +1515,8 @@ def studio_generate_gradio(
         f"🎬 Chế độ: {studio_mode}\n"
         f"🔤 Text Encoder: {active_clip}\n"
         f"✨ Stage 2 Refiner: {stage2_desc}\n"
-        f"⚡ Distilled LoRA: {'Bật' if use_distilled_lora else 'Tắt'}"
+        f"⚡ Distilled LoRA: {'Bật' if use_distilled_lora else 'Tắt'}\n"
+        f"🎙️ Thuyết minh tiếng Việt (Edge-TTS): {'Bật (' + tts_voice.split()[0] + ')' if auto_speech_tts else 'Tắt'}"
     )
 
     generated_videos = []
@@ -1322,36 +1524,78 @@ def studio_generate_gradio(
         label  = f"phân cảnh {i + 1}/{total_scenes}"
         seed_i = base_seed if fixed_seed else (base_seed + i)
 
-        # 1. Làm sạch prompt: loại bỏ audio / speech transcript, tách 2 shot 4s+4s thành nhịp 'Shot 1 | Shot 2' cho PromptRelay
-        p_clean = clean_visual_prompt_for_relay(p)
+        # 1. Trích xuất thẻ [Cast: ...] và thẻ [Scene X], bóc tách lời thoại tiếng Việt
+        tag_active, p_after_tag = extract_cast_tag(p)
+        scene_speech = extract_scene_speech(p, i + 1)
+        p_clean = clean_visual_prompt_for_relay(p_after_tag)
         p_wrap  = apply_quality_wrapping(p_clean, use_wrap=bool(use_quality_wrap))
 
-        # 2. Nhận diện các Act có mặt trong phân cảnh này để chỉ nạp slot ảnh của Act đó
-        if smart_actor_filter and (pic2_name or pic3_name or pic4_name):
+        # 2. Xác định các Act tham gia vào phân cảnh này
+        if actor_assignment_mode and "Thủ công" in actor_assignment_mode:
+            active_map = {
+                "act1": any("Act 1" in s for s in (manual_actors_selected or [])),
+                "act2": any("Act 2" in s for s in (manual_actors_selected or [])),
+                "act3": any("Act 3" in s for s in (manual_actors_selected or [])),
+                "act4": any("Act 4" in s for s in (manual_actors_selected or [])),
+                "act5": any("Act 5" in s for s in (manual_actors_selected or [])),
+                "bg":   any("Background" in s for s in (manual_actors_selected or [])),
+            }
+        elif tag_active is not None:
+            # Ưu tiên cao nhất: Thẻ [Cast: ...] trực tiếp trong prompt
+            active_map = tag_active
+        elif smart_actor_filter and (pic2_name or pic3_name or pic4_name or pic5_name):
+            # Nhận diện tự động theo từ khóa kịch bản
             active_map = detect_active_actors_for_scene(p, prompt_relay_desc or "")
         else:
-            active_map = {"pic1": True, "pic2": True, "pic3": True, "pic4": True, "bg": True}
+            active_map = {"act1": True, "act2": True, "act3": True, "act4": True, "act5": True, "bg": True}
 
-        cur_pic1 = pic1_name if active_map.get("pic1", True) else None
-        cur_pic2 = pic2_name if active_map.get("pic2", False) else None
-        cur_pic3 = pic3_name if active_map.get("pic3", False) else None
-        cur_pic4 = pic4_name if active_map.get("pic4", False) else None
-        cur_bg   = bg_name   if active_map.get("bg", True)   else None
+        # 3. Lọc danh sách nhân vật có mặt và đã upload ảnh
+        candidate_acts = [
+            ("act1", pic1_name, "Act 1: Kuro"),
+            ("act2", pic2_name, "Act 2: Aria"),
+            ("act3", pic3_name, "Act 3: Fenris"),
+            ("act4", pic4_name, "Act 4: Balthazar"),
+            ("act5", pic5_name, "Act 5: Malakor"),
+        ]
 
-        # 3. Chuẩn hóa mô tả Act & Background: phân cách bằng \n\n, chỉ giữ Act xuất hiện trong cảnh
-        scene_relay_desc = format_msr_actor_descriptions(prompt_relay_desc, active_slots=active_map)
+        active_present = []
+        for key, fname, act_label in candidate_acts:
+            if active_map.get(key, False) and fname:
+                active_present.append((key, fname, act_label))
 
-        active_tags = []
-        if cur_pic1: active_tags.append("Act 1")
-        if cur_pic2: active_tags.append("Act 2")
-        if cur_pic3: active_tags.append("Act 3")
-        if cur_pic4: active_tags.append("Act 4")
-        if cur_bg:   active_tags.append("BG")
+        if not active_present and pic1_name:
+            active_present = [("act1", pic1_name, "Act 1: Kuro")]
+
+        warning_note = ""
+        if len(active_present) > 4:
+            warning_note = " (⚠️ Cảnh có >4 nhân vật, ComfyUI MSR giới hạn tối đa 4 slot nên chỉ nạp 4 nhân vật đầu)"
+            active_present = active_present[:4]
+
+        # 4. Ánh xạ động vào 4 cổng pic1, pic2, pic3, pic4 của node ComfyUI
+        cur_pic1 = active_present[0][1] if len(active_present) > 0 else None
+        cur_pic2 = active_present[1][1] if len(active_present) > 1 else None
+        cur_pic3 = active_present[2][1] if len(active_present) > 2 else None
+        cur_pic4 = active_present[3][1] if len(active_present) > 3 else None
+        cur_bg   = bg_name if active_map.get("bg", True) else None
+
+        # 5. Chuẩn hóa mô tả nhân vật cho PromptRelayEncode (Image 1, Image 2...)
+        scene_relay_desc = format_msr_actor_descriptions_dynamic(prompt_relay_desc, active_present, cur_bg)
+
+        active_tags = [item[2] for item in active_present]
+        if cur_bg: active_tags.append("BG")
         active_str = ", ".join(active_tags) if active_tags else "Prompt-only"
+
+        # Hiển thị thông tin lời thoại phân cảnh X lên Status Box
+        speech_display = ""
+        if scene_speech["has_speech"]:
+            s1 = f'   • [00:00-00:04] "{scene_speech["shot1_text"]}"\n' if scene_speech["shot1_text"] else ""
+            s2 = f'   • [00:04-00:08] "{scene_speech["shot2_text"]}"\n' if scene_speech["shot2_text"] else ""
+            speech_display = f"🎙️ Lời thoại Tiếng Việt (Phân cảnh {scene_speech['scene_idx']}):\n{s1}{s2}"
 
         yield generated_videos, None, (
             f"🔄 Đang thực hiện {label}... (Seed: {seed_i})\n"
-            f"👥 Slots nhân vật: [{active_str}]\n"
+            f"👥 Nhân vật trong cảnh: [{active_str}]{warning_note}\n"
+            f"{speech_display}"
             f"🎬 Visual Prompt: {p_clean[:120]}..."
         )
 
@@ -1387,7 +1631,9 @@ def studio_generate_gradio(
                 if not is_done:
                     yield generated_videos, None, (
                         f"🔄 Đang quay {label} ({i + 1}/{total_scenes})...\n"
-                        f"⏳ Tiến độ: {prog_msg}\n📝 Prompt: {p[:120]}..."
+                        f"⏳ Tiến độ: {prog_msg}\n"
+                        f"{speech_display}"
+                        f"📝 Prompt: {p[:120]}..."
                     )
                 else:
                     break
@@ -1400,6 +1646,18 @@ def studio_generate_gradio(
             yield generated_videos, None, f"⚠️ Không tìm thấy file video đầu ra ở {label}!"; return
 
         latest = trim_ref_frames(latest, target_duration_s=int(v_length), fps=v_fps)
+
+        # 6. Tự động lồng tiếng thuyết minh tiếng Việt cho phân cảnh X nếu được bật
+        if auto_speech_tts and scene_speech["has_speech"]:
+            yield generated_videos, None, f"🎙️ Đang tạo giọng đọc thuyết minh tiếng Việt cho {label}..."
+            clean_voice = tts_voice.split()[0].strip() if tts_voice else "vi-VN-NamMinhNeural"
+            tts_file = os.path.join(OUTPUT_DIR, f"scene_{scene_speech['scene_idx']:02d}_speech.mp3")
+            rate_val = int(tts_rate) if tts_rate is not None else 15
+            rate_str = f"+{rate_val}%" if rate_val >= 0 else f"{rate_val}%"
+            gen_audio = generate_speech_audio_edge_tts(scene_speech["full_speech"], voice=clean_voice, rate=rate_str, out_path=tts_file)
+            if gen_audio:
+                latest = mux_speech_to_video(latest, gen_audio)
+
         generated_videos.append(latest)
         yield generated_videos, None, f"🔔 [DING] ✅ Đã hoàn tất {label}!"
 
@@ -1451,8 +1709,8 @@ function(){
 with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple", neutral_hue="slate"), css=custom_css, js=notification_js, title="LTX-2.5 Cinema Studio") as demo:
     with gr.Row(elem_id="ltx-header"):
         gr.Markdown(
-            "# 🎬 LTX-2.5 MSR Studio — 4 Act & 1 Bối Cảnh Multi-Subject Cinema\n"
-            "Sản xuất phim AI chuẩn điện ảnh: **Stage 2 (x2 Spatial Upscale + Refiner)** · **Refine Details LoRA 1.0** · **Gemma 4 12B BF16** · **4 Act + 1 Background MSR**."
+            "# 🎬 LTX-2.5 MSR Studio — 5 Act & 1 Bối Cảnh Multi-Subject Cinema\n"
+            "Sản xuất phim AI chuẩn điện ảnh: **Stage 2 (x2 Spatial Upscale + Refiner)** · **Refine Details LoRA 1.0** · **Gemma 4 12B BF16** · **Dynamic 5 Act + 1 Background MSR**."
         )
 
     with gr.Row():
@@ -1460,36 +1718,61 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple"
         with gr.Column(scale=6):
             mode_select = gr.Dropdown(
                 choices=[
-                    "🎭 MSR Multi-Subject Reference (4 Act + 1 BG)",
+                    "🎭 MSR Multi-Subject Reference (5 Act + 1 BG Dynamic)",
                     "🎥 Cinema Two-Stage (Không dùng ảnh ref)",
                 ],
-                value="🎭 MSR Multi-Subject Reference (4 Act + 1 BG)",
+                value="🎭 MSR Multi-Subject Reference (5 Act + 1 BG Dynamic)",
                 label="🎬 Chế độ Pipeline (Workflow Mode)",
                 interactive=True
             )
 
-            # KHỐI 4 ACT & 1 BACKGROUND
+            # KHỐI 5 ACT & 1 BACKGROUND
             with gr.Group() as msr_img_group:
-                gr.Markdown("#### 👥 4 Act Nhân vật & 1 Bối cảnh (MSR Reference Slots)")
+                gr.Markdown("#### 👥 5 Act Nhân vật & 1 Bối cảnh (MSR Reference Slots)")
                 with gr.Row():
-                    act1_in = gr.Image(label="🎭 Act 1 (Nhân vật 1 / Pic 1 - Bắt buộc)", type="filepath")
-                    act2_in = gr.Image(label="🎭 Act 2 (Nhân vật 2 / Pic 2 - Tuỳ chọn)", type="filepath")
+                    act1_in = gr.Image(label="🎭 Act 1: Mèo Kuro / Lạc Phong (Pic 1 - Bắt buộc)", type="filepath")
+                    act2_in = gr.Image(label="🎭 Act 2: Cáo Aria (Pic 2 - Tuỳ chọn)", type="filepath")
+                    act3_in = gr.Image(label="🎭 Act 3: Sói Fenris (Pic 3 - Tuỳ chọn)", type="filepath")
                 with gr.Row():
-                    act3_in = gr.Image(label="🎭 Act 3 (Nhân vật 3 / Pic 3 - Tuỳ chọn)", type="filepath")
-                    act4_in = gr.Image(label="🎭 Act 4 (Nhân vật 4 / Pic 4 - Tuỳ chọn)", type="filepath")
-                with gr.Row():
-                    bg_in   = gr.Image(label="🏞️ Background (Bối cảnh không gian - Tuỳ chọn)", type="filepath")
+                    act4_in = gr.Image(label="🎭 Act 4: Sư tử Balthazar (Pic 4 - Tuỳ chọn)", type="filepath")
+                    act5_in = gr.Image(label="🎭 Act 5: Quạ Malakor (Pic 5 - Tuỳ chọn)", type="filepath")
+                    bg_in   = gr.Image(label="🏞️ Background: Bối cảnh không gian (Tuỳ chọn)", type="filepath")
+
+            # KHỐI ĐIỀU KHIỂN CHỈ ĐỊNH NHÂN VẬT CHO PHÂN CẢNH
+            with gr.Group():
+                gr.Markdown("#### 🎯 Chỉ định Nhân vật cho Phân cảnh (Scene Actor Assignment)")
+                actor_assignment_mode_in = gr.Radio(
+                    choices=[
+                        "🎯 Tự động theo Kịch bản & Thẻ [Cast: 1, 3, 5] (Khuyên dùng khi chạy nhiều cảnh)",
+                        "✋ Thủ công cố định theo lựa chọn Checkbox bên dưới (Áp dụng cho mọi cảnh)",
+                    ],
+                    value="🎯 Tự động theo Kịch bản & Thẻ [Cast: 1, 3, 5] (Khuyên dùng khi chạy nhiều cảnh)",
+                    label="Cơ chế phân bổ nhân vật"
+                )
+                manual_actors_in = gr.CheckboxGroup(
+                    choices=[
+                        "Act 1 (Mèo Kuro)",
+                        "Act 2 (Cáo Aria)",
+                        "Act 3 (Sói Fenris)",
+                        "Act 4 (Sư tử Balthazar)",
+                        "Act 5 (Quạ Malakor)",
+                        "Background (Bối cảnh)",
+                    ],
+                    value=["Act 1 (Mèo Kuro)", "Background (Bối cảnh)"],
+                    label="☑️ Chọn nhân vật tham gia (Chỉ có tác dụng khi chọn 'Thủ công cố định')",
+                )
 
             # KHỐI PROMPT
             with gr.Group():
                 prompt_relay_in = gr.Textbox(
                     label="📋 Mô tả từng Act & Bối cảnh (Mỗi mô tả cách nhau bằng 1 dòng trống \\n\\n)",
-                    lines=5,
+                    lines=6,
                     placeholder=(
-                        "Mô tả cho Act 1:\nImage 1: Chàng trai quân sư Lạc Phong và mèo đen Kuro mắt hổ phách phát sáng...\n\n"
-                        "Mô tả cho Act 2:\nImage 2: Công chúa Cáo tuyết chín đuôi Aria lông trắng muốt, mắt ngọc bích...\n\n"
-                        "Mô tả cho Act 3:\nImage 3: Đại tướng cự lang Fenris khổng lồ, giáp sắt phù văn phong băng...\n\n"
-                        "Mô tả cho Act 4:\nImage 4: Đại nguyên soái sư tử Balthazar chân cơ giới ma đạo đồng thau...\n\n"
+                        "Mô tả cho Act 1:\nImage 1 (Nạp vào Pic 1 - Mèo Kuro): Mèo đen Kuro mắt hổ phách phát sáng, thuần thúy động vật 4 chân...\n\n"
+                        "Mô tả cho Act 2:\nImage 2 (Nạp vào Pic 2 - Cáo Aria): Công chúa Cáo tuyết chín đuôi Aria lông trắng muốt, mắt ngọc bích...\n\n"
+                        "Mô tả cho Act 3:\nImage 3 (Nạp vào Pic 3 - Sói Fenris): Đại tướng cự lang Fenris khổng lồ, giáp sắt phù văn phong băng...\n\n"
+                        "Mô tả cho Act 4:\nImage 4 (Nạp vào Pic 4 - Sư tử Balthazar): Đại nguyên soái sư tử Balthazar chân cơ giới ma đạo đồng thau...\n\n"
+                        "Mô tả cho Act 5:\nImage 5 (Nạp vào Pic 5 - Quạ Malakor): Đại pháp sư Hắc Quạ Malakor khổng lồ, cánh đen rách bám bùa máu, móng quắp pháp trượng...\n\n"
                         "Mô tả cho Background:\nBackground: Thánh địa cổ thụ Sylvanheim rừng ma thuật..."
                     )
                 )
@@ -1499,7 +1782,11 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple"
                     lines=6,
                     placeholder=(
                         "Dán toàn bộ kịch bản các phân cảnh vào đây.\n"
-                        "Hệ thống sẽ tự động làm sạch Audio/Voiceover, chia nhịp cú máy (0s-4s | 4s-8s), và tự động nạp đúng Act xuất hiện trong từng cảnh."
+                        "Hệ thống sẽ tự động làm sạch Audio/Voiceover, chia nhịp cú máy (0s-4s | 4s-8s), và tự động nạp đúng Act xuất hiện trong từng cảnh.\n"
+                        "💡 Mẹo chỉ định phân cảnh & lời thoại:\n"
+                        "  • Đặt thẻ ở đầu cảnh: [Scene 1 | Cast: Act 1] hoặc [Scene 4 | Cast: Act 1, Act 2]\n"
+                        "  • Nhúng câu thoại tiếng Việt vào diễn xuất trong ngoặc kép: he mutters: \"...\" để AI sinh khẩu hình\n"
+                        "  • Kèm khối Speech: Speech (Vietnamese male voice): [00:00-00:04] \"...\" [00:04-00:08] \"...\" để tự động lồng tiếng!"
                     )
                 )
                 neg_prompt_in = gr.Textbox(
@@ -1507,6 +1794,25 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple"
                     lines=2,
                     value=NEGATIVE_PROMPT_DEFAULT
                 )
+
+            # KHỐI LỒNG TIẾNG & THUYẾT MINH TIẾNG VIỆT (AI SPEECH & EDGE-TTS SYNCHRONIZATION)
+            with gr.Group():
+                gr.Markdown("#### 🎙️ Lồng tiếng & Thuyết minh Tiếng Việt (AI Voiceover Synchronization)")
+                with gr.Row():
+                    auto_speech_tts_in = gr.Checkbox(
+                        label="🎙️ Tự động nhận diện & Lồng tiếng Speech Tiếng Việt cho từng phân cảnh (Edge-TTS)",
+                        value=True,
+                        info="Trích xuất trực tiếp câu thoại tiếng Việt của phân cảnh X từ prompt và tự động hòa trộn vào video."
+                    )
+                    tts_voice_in = gr.Dropdown(
+                        choices=[
+                            "vi-VN-NamMinhNeural (Nam - Trầm ấm, điện ảnh, chiến lược)",
+                            "vi-VN-HoaiMyNeural (Nữ - Truyền cảm, hào sảng, sử thi)",
+                        ],
+                        value="vi-VN-NamMinhNeural (Nam - Trầm ấm, điện ảnh, chiến lược)",
+                        label="Chất giọng thuyết minh"
+                    )
+                    tts_rate_in = gr.Slider(minimum=-20, maximum=50, value=15, step=5, label="Tốc độ đọc (+% rate)")
 
             # THÔNG SỐ QUAY PHIM
             with gr.Row():
@@ -1605,7 +1911,8 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple"
         studio_generate_gradio,
         inputs=[
             mode_select,
-            act1_in, act2_in, act3_in, act4_in, bg_in,
+            act1_in, act2_in, act3_in, act4_in, act5_in, bg_in,
+            actor_assignment_mode_in, manual_actors_in,
             prompt_relay_in, prompt_main_in, neg_prompt_in,
             aspect_in, duration_in, fps_in, seed_in, segments_in, fixed_seed_in,
             cfg_in, msr_str_in, ref_frames_in, stage2_in, lowvram_in, wrap_in,
@@ -1613,6 +1920,9 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet", secondary_hue="purple"
             text_encoder_in,
             refine_lora_in, refine_lora_str_in,
             smart_filter_in,
+            auto_speech_tts_in,
+            tts_voice_in,
+            tts_rate_in,
         ],
         outputs=[gallery_out, final_video_out, status_box]
     )
